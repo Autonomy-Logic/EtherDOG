@@ -29,9 +29,10 @@
 #if !defined(__CYGWIN__) && !defined(_WIN32)
 #include <sys/socket.h>
 #define ECAT_BUSY_POLL_US 50
+#endif
+
 /* Zero-output frames sent on close until one comes back */
 #define ECAT_ZERO_OUTPUT_ATTEMPTS 3
-#endif
 
 /* encode_sdo_value copies host bytes into the little-endian wire buffer; a big-endian port needs
  * htole32/htole64 there. */
