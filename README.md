@@ -19,7 +19,7 @@ Built on [SOEM](https://github.com/OpenEtherCATsociety/SOEM).
 ## Build
 
 ```sh
-git clone --recurse-submodules <repository>
+git clone --recurse-submodules https://github.com/Autonomy-Logic/EtherDOG
 cmake -S EtherDOG -B EtherDOG/build -DCMAKE_BUILD_TYPE=Release
 cmake --build EtherDOG/build -j
 ```
