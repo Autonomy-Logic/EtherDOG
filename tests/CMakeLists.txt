@@ -8,6 +8,10 @@ target_include_directories(unity PUBLIC ${PROJECT_SOURCE_DIR}/libs/unity/src)
 target_compile_definitions(unity PUBLIC UNITY_INCLUDE_DOUBLE)
 
 file(GLOB TEST_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_*.c)
+# ecat_run_argv is a stub on MSYS2/Cygwin
+if(CMAKE_SYSTEM_NAME STREQUAL "MSYS" OR CMAKE_SYSTEM_NAME STREQUAL "CYGWIN")
+    list(FILTER TEST_SOURCES EXCLUDE REGEX "test_proc\\.c$")
+endif()
 foreach(src ${TEST_SOURCES})
     get_filename_component(name ${src} NAME_WE)
     set(runner ${CMAKE_CURRENT_BINARY_DIR}/${name}_runner.c)

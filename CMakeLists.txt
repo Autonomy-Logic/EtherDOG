@@ -44,7 +44,7 @@ target_include_directories(soem PUBLIC\n\
   $<INSTALL_INTERFACE:include/soem>\n\
 )\n\
 \n\
-target_compile_options(soem PUBLIC\n\
+target_compile_options(soem PRIVATE\n\
   $<$<C_COMPILER_ID:GNU>:-std=c11>\n\
 )\n\
 \n\
@@ -118,6 +118,7 @@ add_library(etherdog_core STATIC
     src/config.c
     src/control.c
     src/data.c
+    src/dgram.c
     src/iface_state.c
     src/layout.c
     src/log.c
@@ -135,6 +136,10 @@ target_compile_definitions(etherdog_core PUBLIC EDOG_VERSION="${ETHERDOG_VERSION
 target_compile_options(etherdog_core PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare)
 
 find_package(Threads REQUIRED)
+# SOEM links ws2_32, which also exports socket/bind/sendto; list cygwin first so the POSIX ones win
+if(CYGWIN OR CMAKE_SYSTEM_NAME STREQUAL "MSYS")
+    target_link_libraries(etherdog_core PUBLIC cygwin)
+endif()
 target_link_libraries(etherdog_core PUBLIC soem Threads::Threads)
 if(UNIX AND NOT APPLE AND NOT CYGWIN AND NOT CMAKE_SYSTEM_NAME STREQUAL "MSYS")
     target_link_libraries(etherdog_core PUBLIC rt)

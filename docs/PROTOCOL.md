@@ -13,7 +13,7 @@ Protocol version: **1**.
 |---|---|---|
 | Control | `unix:<path>` | Linux default `unix:/run/etherdog/etherdog.socket`. The socket is created with mode `0600`. |
 | Control | `tcp:<loopback ip>:<port>` | Windows (MSYS2) default `tcp:127.0.0.1:18444`. Only loopback addresses are accepted. |
-| Data | `unix:<path>` | Datagram socket. The client binds it before `open_data`. |
+| Data | `unix:<path>` | Datagram socket. The client binds it before `open_data`. Not available on Windows (MSYS2). |
 | Data | `udp:<loopback ip>:<port>` | Only loopback addresses are accepted. |
 
 ## Control channel

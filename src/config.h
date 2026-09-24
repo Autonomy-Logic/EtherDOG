@@ -18,6 +18,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 
+#include "dgram.h"
 #include "log.h"
 #include "soem/soem.h"
 
@@ -487,9 +488,7 @@ typedef struct {
     pthread_mutex_t lock;
     bool            open;
     int             fd;                  /* non-blocking datagram socket       */
-    int             family;              /* AF_UNIX or AF_INET                  */
-    uint8_t         peer[128];           /* struct sockaddr_storage of client   */
-    uint32_t        peer_len;
+    edog_dgram_peer_t peer;              /* client endpoint                     */
     char            local_path[108];     /* AF_UNIX: our bound path, unlinked on close */
     uint64_t        session;
     uint32_t        tx_seq;              /* inputs sent                         */

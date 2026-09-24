@@ -8,23 +8,20 @@
 
 #include "config.h"
 #include "data.h"
+#include "dgram.h"
 #include "etherdog_protocol.h"
 #include "layout.h"
 #include "unity.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 static ecat_master_instance_t inst;
 static edog_logger_t logger;
 static int client_fd = -1;
 static char client_path[108];
+static char server[160];
 static const char *STATE_DIR = "/tmp";
 
 static void add_entry(ecat_pdo_t *pdo, const char *index, uint8_t sub, uint8_t bits,
@@ -71,40 +68,20 @@ void setUp(void)
 void tearDown(void)
 {
     ecat_data_destroy(&inst);
-    if (client_fd >= 0)
-        close(client_fd);
+    edog_dgram_close(client_fd, client_path);
     client_fd = -1;
-    if (client_path[0] != '\0')
-        unlink(client_path);
     client_path[0] = '\0';
 }
 
-static void open_unix_client(char *endpoint, size_t size)
+/* The spec only picks the family; the client binds its own address. */
+static void open_client(const char *family_spec, char *endpoint, size_t size)
 {
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    snprintf(client_path, sizeof(client_path), "/tmp/edog-test-client-%ld.sock", (long)getpid());
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", client_path);
-    unlink(client_path);
-    client_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-    TEST_ASSERT_TRUE(client_fd >= 0);
-    TEST_ASSERT_EQUAL_INT(0, bind(client_fd, (struct sockaddr *)&addr, sizeof(addr)));
-    snprintf(endpoint, size, "unix:%s", client_path);
-}
-
-static void open_udp_client(char *endpoint, size_t size)
-{
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    socklen_t len = sizeof(addr);
-    client_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    TEST_ASSERT_TRUE(client_fd >= 0);
-    TEST_ASSERT_EQUAL_INT(0, bind(client_fd, (struct sockaddr *)&addr, sizeof(addr)));
-    TEST_ASSERT_EQUAL_INT(0, getsockname(client_fd, (struct sockaddr *)&addr, &len));
-    snprintf(endpoint, size, "udp:127.0.0.1:%u", (unsigned)ntohs(addr.sin_port));
+    edog_dgram_peer_t family;
+    char err[128];
+    TEST_ASSERT_EQUAL_INT(0, edog_dgram_parse(family_spec, &family, err, sizeof(err)));
+    client_fd = edog_dgram_open(&family, STATE_DIR, 99, client_path, sizeof(client_path),
+                                endpoint, size, err, sizeof(err));
+    TEST_ASSERT_TRUE_MESSAGE(client_fd >= 0, err);
 }
 
 static void send_outputs(const char *server, uint64_t session, uint32_t seq, uint8_t flags,
@@ -115,23 +92,23 @@ static void send_outputs(const char *server, uint64_t session, uint32_t seq, uin
     edog_frame_encode_header(frame, &h);
     memcpy(frame + EDOG_FRAME_HEADER_SIZE, payload, len);
 
-    struct sockaddr_storage to;
-    socklen_t to_len;
-    memset(&to, 0, sizeof(to));
-    if (strncmp(server, "unix:", 5) == 0) {
-        struct sockaddr_un *un = (struct sockaddr_un *)&to;
-        un->sun_family = AF_UNIX;
-        snprintf(un->sun_path, sizeof(un->sun_path), "%s", server + 5);
-        to_len = sizeof(*un);
-    } else {
-        struct sockaddr_in *in = (struct sockaddr_in *)&to;
-        in->sin_family = AF_INET;
-        in->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        in->sin_port = htons((uint16_t)atoi(strrchr(server, ':') + 1));
-        to_len = sizeof(*in);
+    edog_dgram_peer_t to;
+    char err[128];
+    TEST_ASSERT_EQUAL_INT(0, edog_dgram_parse(server, &to, err, sizeof(err)));
+    TEST_ASSERT_TRUE(edog_dgram_send(client_fd, frame, EDOG_FRAME_HEADER_SIZE + len, &to) > 0);
+}
+
+static ssize_t recv_frame(uint8_t *buf, size_t size)
+{
+    edog_dgram_peer_t any = { .family = -1 };
+    bool from_peer = false;
+    for (int i = 0; i < 100; i++) {
+        ssize_t n = edog_dgram_recv(client_fd, buf, size, &any, &from_peer);
+        if (n >= 0)
+            return n;
+        usleep(1000);
     }
-    TEST_ASSERT_TRUE(sendto(client_fd, frame, EDOG_FRAME_HEADER_SIZE + len, 0,
-                            (struct sockaddr *)&to, to_len) > 0);
+    return -1;
 }
 
 /* --- layout ------------------------------------------------------------------------------ */
@@ -158,15 +135,19 @@ void test_layout_fails_when_slave_missing(void)
 
 /* --- data session ------------------------------------------------------------------------ */
 
+/* Cygwin AF_UNIX datagrams carry no sender path, so the session cannot verify the peer */
+#if defined(__CYGWIN__)
+#define DEFAULT_UDP true
+#else
+#define DEFAULT_UDP false
+#endif
+
 static void round_trip(bool udp)
 {
     TEST_ASSERT_EQUAL_INT(0, ecat_layout_build(&inst, &logger));
-    char endpoint[160], server[160], err[256];
+    char endpoint[160], err[256];
     uint64_t session = 0;
-    if (udp)
-        open_udp_client(endpoint, sizeof(endpoint));
-    else
-        open_unix_client(endpoint, sizeof(endpoint));
+    open_client(udp ? "udp:127.0.0.1:1" : "unix:/unused", endpoint, sizeof(endpoint));
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, ecat_data_open(&inst, 0, endpoint, STATE_DIR, server,
                                                     sizeof(server), &session, err, sizeof(err)), err);
     TEST_ASSERT_TRUE(session != 0);
@@ -176,7 +157,7 @@ static void round_trip(bool udp)
     ecat_data_publish_inputs(&inst, 0, 3, true, true);
 
     uint8_t buf[256];
-    ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
+    ssize_t n = recv_frame(buf, sizeof(buf));
     edog_frame_header_t h;
     TEST_ASSERT_TRUE(edog_frame_decode_header(buf, (size_t)n, &h));
     TEST_ASSERT_EQUAL_UINT8(EDOG_FRAME_INPUTS, h.kind);
@@ -196,6 +177,9 @@ static void round_trip(bool udp)
 
 void test_data_round_trip_unix(void)
 {
+#if defined(__CYGWIN__)
+    TEST_IGNORE_MESSAGE("AF_UNIX peer check unsupported on Cygwin");
+#endif
     round_trip(false);
 }
 
@@ -206,9 +190,7 @@ void test_data_round_trip_udp(void)
 
 void test_data_drops_wrong_session_and_old_sequence(void)
 {
-    round_trip(false);
-    char server[160];
-    snprintf(server, sizeof(server), "unix:%s", inst.data.local_path);
+    round_trip(DEFAULT_UDP);
 
     uint8_t out = 0x00;
     send_outputs(server, inst.data.session + 1, 2, EDOG_FLAG_VALID, &out, 1);
@@ -221,7 +203,7 @@ void test_data_drops_wrong_session_and_old_sequence(void)
 
 void test_data_watchdog_zeroes_outputs(void)
 {
-    round_trip(false);
+    round_trip(DEFAULT_UDP);
     for (int i = 0; i < (ECAT_DATA_TIMEOUT_MS * 1000) / 1000 + 1; i++)
         ecat_data_apply_outputs(&inst, 0);
     TEST_ASSERT_EQUAL_HEX8(0x00, inst.iomap[0]);
