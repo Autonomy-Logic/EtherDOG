@@ -29,7 +29,7 @@ Every field below is optional unless marked **required**. The defaults are shown
 | `receive_timeout_us` | `2000` | Time to wait for the frame to return (minimum 200). |
 | `watchdog_timeout_cycles` | `3` | Accepted for compatibility; not used. |
 | `task_priority` | `90` | SCHED_FIFO priority of the bus thread (1-99). |
-| `safe_close` | `true` | Zero the outputs and wait for INIT on stop. |
+| `safe_close` | `true` | Accepted for compatibility; not used. Outputs are always zeroed on stop and exit. |
 | `log_level` | `"info"` | Accepted for compatibility; the process level is set with `--log-level`. |
 
 ## slaves[]

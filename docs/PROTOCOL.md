@@ -45,7 +45,7 @@ Any other first request, or a wrong token, gets an error and the connection is c
 | `configure` | `path` (optional) | Load a bus configuration file ([BUSCONFIG.md](BUSCONFIG.md)), replacing the current one. Refused while the bus runs. Without `path`, clears the configuration. The reply lists the masters (`index`, `name`, `interface`, `cycle_time_us`, `task_priority`, `slave_count`). |
 | `start` | none | Brings every master to OPERATIONAL. Safe to repeat. The reply gives `started` and `total`. |
 | `stop` | none | Drives the outputs to zero, moves the slaves to INIT, closes the data sessions. |
-| `shutdown` | none | Stops the bus and exits the process. |
+| `shutdown` | none | Stops the bus (outputs to zero, slaves to INIT) and exits the process. |
 
 ### Process data
 
@@ -138,6 +138,10 @@ EtherDOG drops an output frame when any of these is wrong:
 - the sequence (it must be newer than the last applied frame).
 
 If no valid output frame arrives for 100 ms, EtherDOG writes zeros to the outputs and counts a watchdog trip. Normal outputs resume with the next valid frame.
+
+## Outputs on exit
+
+EtherDOG drives the outputs to zero whenever it leaves the bus: on `stop`, on `shutdown`, and when it receives SIGINT, SIGTERM, SIGHUP or SIGQUIT. The zero frame is resent until a slave answers (up to 3 times), then the slaves are moved to INIT. If the process is killed outright (SIGKILL, a crash), it cannot do this; the slaves' sync manager watchdog then takes the outputs to their safe state (`watchdog.sm_watchdog_ms` in the bus configuration, 100 ms by default).
 
 ## Logs
 

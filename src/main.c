@@ -79,9 +79,12 @@ static void install_signals(void)
     memset(&sa, 0, sizeof(sa));
     sigemptyset(&sa.sa_mask);
 
+    /* Every catchable way to be told to exit goes through the clean stop that zeroes the outputs */
     sa.sa_handler = on_terminate;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    sigaction(SIGQUIT, &sa, NULL);
 
     sa.sa_handler = on_wake; /* no SA_RESTART: clock_nanosleep must return EINTR */
     sigaction(SIGUSR1, &sa, NULL);

@@ -29,6 +29,8 @@
 #if !defined(__CYGWIN__) && !defined(_WIN32)
 #include <sys/socket.h>
 #define ECAT_BUSY_POLL_US 50
+/* Zero-output frames sent on close until one comes back */
+#define ECAT_ZERO_OUTPUT_ATTEMPTS 3
 #endif
 
 /* encode_sdo_value copies host bytes into the little-endian wire buffer; a big-endian port needs
@@ -806,17 +808,19 @@ int ecat_master_transition_to_op(ecat_master_instance_t *inst, edog_logger_t *lo
 void ecat_master_close(ecat_master_instance_t *inst, edog_logger_t *logger)
 {
     if (inst->soem_initialized) {
-        /* Step 1: zero the outputs before leaving OP (safe_close); skipped before mapping. */
-        if (inst->config.master.safe_close && inst->iomap_used_size > 0) {
-            edog_log_info(logger,
-                "Zeroing outputs and sending final processdata before close");
+        /* Step 1: zero the outputs before leaving OP, on every stop and exit; skipped before mapping */
+        if (inst->iomap_used_size > 0) {
+            edog_log_info(logger, "Zeroing outputs before close");
             memset(inst->iomap, 0, inst->iomap_used_size);
-            ecx_send_processdata(&inst->ecx_context);
-            int wkc = ecx_receive_processdata(&inst->ecx_context, EC_TIMEOUTRET);
+            int wkc = 0;
+            for (int attempt = 0; attempt < ECAT_ZERO_OUTPUT_ATTEMPTS && wkc <= 0; attempt++) {
+                ecx_send_processdata(&inst->ecx_context);
+                wkc = ecx_receive_processdata(&inst->ecx_context, EC_TIMEOUTRET);
+            }
             if (wkc <= 0) {
                 edog_log_warn(logger,
-                    "Final processdata returned wkc=%d -- outputs may not have "
-                    "reached slaves; falling back to slave SM watchdog", wkc);
+                    "Zeroed outputs got no reply after %d attempts -- relying on the slaves' "
+                    "SM watchdog", ECAT_ZERO_OUTPUT_ATTEMPTS);
             }
         }
 

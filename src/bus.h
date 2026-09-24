@@ -32,7 +32,7 @@ int ecat_bus_configure(const char *path, char *err, size_t err_size);
 /** Bring every configured master to OPERATIONAL. Returns how many run, or -1 if none. */
 int ecat_bus_start(char *err, size_t err_size);
 
-/** Stop every master: outputs zeroed (safe_close), slaves to INIT, sessions closed. */
+/** Stop every master: outputs zeroed, slaves to INIT, sessions closed. */
 void ecat_bus_stop(void);
 
 /** Stop and free everything. */
