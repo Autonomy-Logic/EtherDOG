@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CMake 3.28+
+        run: pip install --user "cmake>=3.28"
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DETHERDOG_BUILD_TESTS=ON
+          cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

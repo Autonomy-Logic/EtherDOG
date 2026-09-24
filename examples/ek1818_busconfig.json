@@ -1,0 +1,332 @@
+[
+  {
+    "name": "ethercat_master",
+    "protocol": "ETHERCAT",
+    "config": {
+      "master": {
+        "interface": "eth0",
+        "cycle_time_us": 1000,
+        "watchdog_timeout_cycles": 3,
+        "task_priority": 90
+      },
+      "slaves": [
+        {
+          "position": 1,
+          "name": "EK1818",
+          "type": "coupler",
+          "vendor_id": "0x2",
+          "product_code": "0x071a2c52",
+          "revision": "0x00100000",
+          "config": {
+            "startup_checks": {
+              "check_vendor_id": true,
+              "check_product_code": true
+            },
+            "addressing": {
+              "ethercat_address": 0
+            },
+            "timeouts": {
+              "sdo_timeout_ms": 1000,
+              "init_to_preop_timeout_ms": 3000,
+              "safeop_to_op_timeout_ms": 10000
+            },
+            "watchdog": {
+              "sm_watchdog_enabled": true,
+              "sm_watchdog_ms": 100,
+              "pdi_watchdog_enabled": false,
+              "pdi_watchdog_ms": 100
+            },
+            "distributed_clocks": {
+              "enabled": false,
+              "sync_unit_cycle_us": 0,
+              "sync0_enabled": false,
+              "sync0_cycle_us": 0,
+              "sync0_shift_us": 0,
+              "sync1_enabled": false,
+              "sync1_cycle_us": 0,
+              "sync1_shift_us": 0
+            }
+          },
+          "channels": [
+            {
+              "index": 0,
+              "name": "Input 1",
+              "type": "digital_input",
+              "bit_length": 1,
+              "pdo_index": "0x1a00",
+              "pdo_entry_index": "0x6000",
+              "pdo_entry_subindex": 1
+            },
+            {
+              "index": 1,
+              "name": "Input 2",
+              "type": "digital_input",
+              "bit_length": 1,
+              "pdo_index": "0x1a01",
+              "pdo_entry_index": "0x6010",
+              "pdo_entry_subindex": 1
+            },
+            {
+              "index": 2,
+              "name": "Input 3",
+              "type": "digital_input",
+              "bit_length": 1,
+              "pdo_index": "0x1a02",
+              "pdo_entry_index": "0x6020",
+              "pdo_entry_subindex": 1
+            },
+            {
+              "index": 3,
+              "name": "Input 4",
+              "type": "digital_input",
+              "bit_length": 1,
+              "pdo_index": "0x1a03",
+              "pdo_entry_index": "0x6030",
+              "pdo_entry_subindex": 1
+            },
+            {
+              "index": 4,
+              "name": "Input 5",
+              "type": "digital_input",
+              "bit_length": 1,
+              "pdo_index": "0x1a04",
+              "pdo_entry_index": "0x6040",
+              "pdo_entry_subindex": 1
+            },
+            {
+              "index": 5,
+              "name": "Input 6",
+              "type": "digital_input",
+              "bit_length": 1,
+              "pdo_index": "0x1a05",
+              "pdo_entry_index": "0x6050",
+              "pdo_entry_subindex": 1
+            },
+            {
+              "index": 6,
+              "name": "Input 7",
+              "type": "digital_input",
+              "bit_length": 1,
+              "pdo_index": "0x1a06",
+              "pdo_entry_index": "0x6060",
+              "pdo_entry_subindex": 1
+            },
+            {
+              "index": 7,
+              "name": "Input 8",
+              "type": "digital_input",
+              "bit_length": 1,
+              "pdo_index": "0x1a07",
+              "pdo_entry_index": "0x6070",
+              "pdo_entry_subindex": 1
+            },
+            {
+              "index": 8,
+              "name": "Output 1",
+              "type": "digital_output",
+              "bit_length": 1,
+              "pdo_index": "0x1600",
+              "pdo_entry_index": "0x7000",
+              "pdo_entry_subindex": 1
+            },
+            {
+              "index": 9,
+              "name": "Output 2",
+              "type": "digital_output",
+              "bit_length": 1,
+              "pdo_index": "0x1601",
+              "pdo_entry_index": "0x7010",
+              "pdo_entry_subindex": 1
+            },
+            {
+              "index": 10,
+              "name": "Output 3",
+              "type": "digital_output",
+              "bit_length": 1,
+              "pdo_index": "0x1602",
+              "pdo_entry_index": "0x7020",
+              "pdo_entry_subindex": 1
+            },
+            {
+              "index": 11,
+              "name": "Output 4",
+              "type": "digital_output",
+              "bit_length": 1,
+              "pdo_index": "0x1603",
+              "pdo_entry_index": "0x7030",
+              "pdo_entry_subindex": 1
+            }
+          ],
+          "sdo_configurations": [],
+          "rx_pdos": [
+            {
+              "index": "0x1600",
+              "name": "Channel 9",
+              "entries": [
+                {
+                  "index": "0x7000",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Output",
+                  "data_type": "BOOL"
+                }
+              ]
+            },
+            {
+              "index": "0x1601",
+              "name": "Channel 10",
+              "entries": [
+                {
+                  "index": "0x7010",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Output",
+                  "data_type": "BOOL"
+                }
+              ]
+            },
+            {
+              "index": "0x1602",
+              "name": "Channel 11",
+              "entries": [
+                {
+                  "index": "0x7020",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Output",
+                  "data_type": "BOOL"
+                }
+              ]
+            },
+            {
+              "index": "0x1603",
+              "name": "Channel 12",
+              "entries": [
+                {
+                  "index": "0x7030",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Output",
+                  "data_type": "BOOL"
+                }
+              ]
+            }
+          ],
+          "tx_pdos": [
+            {
+              "index": "0x1a00",
+              "name": "Channel 1",
+              "entries": [
+                {
+                  "index": "0x6000",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Input",
+                  "data_type": "BOOL"
+                }
+              ]
+            },
+            {
+              "index": "0x1a01",
+              "name": "Channel 2",
+              "entries": [
+                {
+                  "index": "0x6010",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Input",
+                  "data_type": "BOOL"
+                }
+              ]
+            },
+            {
+              "index": "0x1a02",
+              "name": "Channel 3",
+              "entries": [
+                {
+                  "index": "0x6020",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Input",
+                  "data_type": "BOOL"
+                }
+              ]
+            },
+            {
+              "index": "0x1a03",
+              "name": "Channel 4",
+              "entries": [
+                {
+                  "index": "0x6030",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Input",
+                  "data_type": "BOOL"
+                }
+              ]
+            },
+            {
+              "index": "0x1a04",
+              "name": "Channel 5",
+              "entries": [
+                {
+                  "index": "0x6040",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Input",
+                  "data_type": "BOOL"
+                }
+              ]
+            },
+            {
+              "index": "0x1a05",
+              "name": "Channel 6",
+              "entries": [
+                {
+                  "index": "0x6050",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Input",
+                  "data_type": "BOOL"
+                }
+              ]
+            },
+            {
+              "index": "0x1a06",
+              "name": "Channel 7",
+              "entries": [
+                {
+                  "index": "0x6060",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Input",
+                  "data_type": "BOOL"
+                }
+              ]
+            },
+            {
+              "index": "0x1a07",
+              "name": "Channel 8",
+              "entries": [
+                {
+                  "index": "0x6070",
+                  "subindex": 1,
+                  "bit_length": 1,
+                  "name": "Input",
+                  "data_type": "BOOL"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "diagnostics": {
+        "log_connections": true,
+        "log_data_access": false,
+        "log_errors": true,
+        "max_log_entries": 1000,
+        "status_update_interval_ms": 500
+      }
+    }
+  }
+]

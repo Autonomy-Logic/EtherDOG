@@ -1,0 +1,6 @@
+[submodule "libs/soem"]
+	path = libs/soem
+	url = https://github.com/OpenEtherCATsociety/SOEM.git
+[submodule "libs/unity"]
+	path = libs/unity
+	url = https://github.com/ThrowTheSwitch/Unity.git
