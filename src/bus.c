@@ -23,6 +23,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1206,20 +1207,57 @@ void ecat_bus_shutdown(void)
  * @brief Validate a network interface name for safe use in SOEM calls.
  *
  * Accepts Linux names (e.g. "eth0") and Windows NPF device paths
- * (e.g. "\\Device\\NPF_{GUID}").  Writes a JSON error to @p response
+ * (e.g. "\\Device\\NPF_{GUID}").  Writes a JSON error to @p out
  * on failure.
  *
- * @return 0 if valid, -1 if invalid (response already filled)
+ * @return 0 if valid, -1 if invalid (@p out already filled)
  */
-static int validate_interface_name(const char *ifname, char *response, size_t response_size)
+/* --- command replies: heap strings, so a reply has no size limit ---------------------------- */
+
+typedef struct {
+    char *text;
+} ecat_reply_t;
+
+static void reply_set(ecat_reply_t *out, char *text)
+{
+    free(out->text);
+    out->text = text;
+}
+
+static void reply_printf(ecat_reply_t *out, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+static void reply_printf(ecat_reply_t *out, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    char *text = n >= 0 ? malloc((size_t)n + 1) : NULL;
+    if (text != NULL) {
+        va_start(ap, fmt);
+        vsnprintf(text, (size_t)n + 1, fmt, ap);
+        va_end(ap);
+    }
+    reply_set(out, text);
+}
+
+/* Takes ownership of @p resp. */
+static int reply_json(ecat_reply_t *out, cJSON *resp)
+{
+    reply_set(out, cJSON_PrintUnformatted(resp));
+    cJSON_Delete(resp);
+    return out->text != NULL ? 0 : -1;
+}
+
+static int validate_interface_name(const char *ifname, ecat_reply_t *out)
 {
     size_t ifname_len = strlen(ifname);
     if (ifname_len == 0 || ifname_len >= ECAT_IFNAME_MAX) {
-        snprintf(response, response_size, "{\"error\":\"invalid interface name length\"}");
+        reply_printf(out, "{\"error\":\"invalid interface name length\"}");
         return -1;
     }
     if (!ecat_iface_validate(ifname, ECAT_IFACE_ANY_PLATFORM)) {
-        snprintf(response, response_size, "{\"error\":\"invalid interface name format\"}");
+        reply_printf(out, "{\"error\":\"invalid interface name format\"}");
         return -1;
     }
     return 0;
@@ -1248,23 +1286,22 @@ static bool any_master_active(void)
  * Creates a separate ecx_contextt (not the master's context) to scan
  * the bus for slaves. This allows scanning even when the master is not running.
  */
-static int handle_scan_command(cJSON *root, char *response, size_t response_size)
+static int handle_scan_command(cJSON *root, ecat_reply_t *out)
 {
     cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
     cJSON *iface = params ? cJSON_GetObjectItemCaseSensitive(params, "interface") : NULL;
 
     if (!iface || !cJSON_IsString(iface)) {
-        snprintf(response, response_size, "{\"error\":\"missing 'interface' param\"}");
+        reply_printf(out, "{\"error\":\"missing 'interface' param\"}");
         return -1;
     }
 
-    if (validate_interface_name(iface->valuestring, response, response_size) != 0)
+    if (validate_interface_name(iface->valuestring, out) != 0)
         return -1;
 
     /* Refuse scan while any master is actively running on the bus */
     if (any_master_active()) {
-        snprintf(response, response_size,
-            "{\"error\":\"EtherCAT master is running. Stop the bus before scanning.\"}");
+        reply_printf(out, "{\"error\":\"EtherCAT master is running. Stop the bus before scanning.\"}");
         return -1;
     }
 
@@ -1273,16 +1310,14 @@ static int handle_scan_command(cJSON *root, char *response, size_t response_size
     memset(&scan_ctx, 0, sizeof(scan_ctx));
 
     if (!ecx_init(&scan_ctx, iface->valuestring)) {
-        snprintf(response, response_size,
-            "{\"error\":\"Failed to open interface '%s'\"}", iface->valuestring);
+        reply_printf(out, "{\"error\":\"Failed to open interface '%s'\"}", iface->valuestring);
         return -1;
     }
 
     int slave_count = ecx_config_init(&scan_ctx);
     if (slave_count <= 0) {
         ecx_close(&scan_ctx);
-        snprintf(response, response_size,
-            "{\"status\":\"success\",\"devices\":[],\"message\":\"No slaves found\",\"slave_count\":0}");
+        reply_printf(out, "{\"status\":\"success\",\"devices\":[],\"message\":\"No slaves found\",\"slave_count\":0}");
         return 0;
     }
 
@@ -1313,11 +1348,7 @@ static int handle_scan_command(cJSON *root, char *response, size_t response_size
     cJSON_AddStringToObject(resp, "message", msg);
     cJSON_AddNumberToObject(resp, "slave_count", scan_ctx.slavecount);
 
-    char *json_str = cJSON_PrintUnformatted(resp);
-    if (json_str) {
-        snprintf(response, response_size, "%s", json_str);
-        free(json_str);
-    }
+    reply_set(out, cJSON_PrintUnformatted(resp));
     cJSON_Delete(resp);
 
     ecx_close(&scan_ctx);
@@ -1330,7 +1361,7 @@ static int handle_scan_command(cJSON *root, char *response, size_t response_size
  * Uses ec_find_adapters() from SOEM to enumerate network adapters.
  * Does not require a SOEM context or bus access.
  */
-static int handle_list_interfaces_command(char *response, size_t response_size)
+static int handle_list_interfaces_command(ecat_reply_t *out)
 {
     ec_adaptert *adapters = ec_find_adapters();
 
@@ -1351,11 +1382,7 @@ static int handle_list_interfaces_command(char *response, size_t response_size)
     snprintf(msg, sizeof(msg), "Found %d network interface(s)", count);
     cJSON_AddStringToObject(resp, "message", msg);
 
-    char *json_str = cJSON_PrintUnformatted(resp);
-    if (json_str) {
-        snprintf(response, response_size, "%s", json_str);
-        free(json_str);
-    }
+    reply_set(out, cJSON_PrintUnformatted(resp));
     cJSON_Delete(resp);
     ec_free_adapters(adapters);
 
@@ -1367,34 +1394,33 @@ static int handle_list_interfaces_command(char *response, size_t response_size)
  *
  * Scans with a separate ecx_contextt and reports the slave at the requested position.
  */
-static int handle_test_command(cJSON *root, char *response, size_t response_size)
+static int handle_test_command(cJSON *root, ecat_reply_t *out)
 {
     cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
     cJSON *iface = params ? cJSON_GetObjectItemCaseSensitive(params, "interface") : NULL;
     cJSON *pos = params ? cJSON_GetObjectItemCaseSensitive(params, "position") : NULL;
 
     if (!iface || !cJSON_IsString(iface)) {
-        snprintf(response, response_size, "{\"error\":\"missing 'interface' param\"}");
+        reply_printf(out, "{\"error\":\"missing 'interface' param\"}");
         return -1;
     }
     if (!pos || !cJSON_IsNumber(pos)) {
-        snprintf(response, response_size, "{\"error\":\"missing 'position' param\"}");
+        reply_printf(out, "{\"error\":\"missing 'position' param\"}");
         return -1;
     }
 
     int position = pos->valueint;
     if (position < 1) {
-        snprintf(response, response_size, "{\"error\":\"'position' must be a positive integer\"}");
+        reply_printf(out, "{\"error\":\"'position' must be a positive integer\"}");
         return -1;
     }
 
-    if (validate_interface_name(iface->valuestring, response, response_size) != 0)
+    if (validate_interface_name(iface->valuestring, out) != 0)
         return -1;
 
     /* Refuse test while any master is actively running on the bus */
     if (any_master_active()) {
-        snprintf(response, response_size,
-            "{\"error\":\"EtherCAT master is running. Stop the bus before testing.\"}");
+        reply_printf(out, "{\"error\":\"EtherCAT master is running. Stop the bus before testing.\"}");
         return -1;
     }
 
@@ -1402,16 +1428,14 @@ static int handle_test_command(cJSON *root, char *response, size_t response_size
     memset(&test_ctx, 0, sizeof(test_ctx));
 
     if (!ecx_init(&test_ctx, iface->valuestring)) {
-        snprintf(response, response_size,
-            "{\"error\":\"Failed to open interface '%s'\"}", iface->valuestring);
+        reply_printf(out, "{\"error\":\"Failed to open interface '%s'\"}", iface->valuestring);
         return -1;
     }
 
     int slave_count = ecx_config_init(&test_ctx);
     if (slave_count <= 0) {
         ecx_close(&test_ctx);
-        snprintf(response, response_size,
-            "{\"status\":\"success\",\"connected\":false,\"device\":null,"
+        reply_printf(out, "{\"status\":\"success\",\"connected\":false,\"device\":null,"
             "\"message\":\"No EtherCAT slaves found on the network\"}");
         return 0;
     }
@@ -1422,8 +1446,7 @@ static int handle_test_command(cJSON *root, char *response, size_t response_size
             "No device at position %d. Found %d slave(s).",
             position, test_ctx.slavecount);
         ecx_close(&test_ctx);
-        snprintf(response, response_size,
-            "{\"status\":\"error\",\"connected\":false,\"device\":null,"
+        reply_printf(out, "{\"status\":\"error\",\"connected\":false,\"device\":null,"
             "\"message\":\"%s\"}", errmsg);
         return -1;
     }
@@ -1453,11 +1476,7 @@ static int handle_test_command(cJSON *root, char *response, size_t response_size
         "Successfully connected to %s at position %d", s->name, position);
     cJSON_AddStringToObject(resp, "message", msg);
 
-    char *json_str = cJSON_PrintUnformatted(resp);
-    if (json_str) {
-        snprintf(response, response_size, "%s", json_str);
-        free(json_str);
-    }
+    reply_set(out, cJSON_PrintUnformatted(resp));
     cJSON_Delete(resp);
 
     ecx_close(&test_ctx);
@@ -1636,7 +1655,7 @@ static cJSON *build_master_status_json(ecat_master_instance_t *inst)
  *
  * Returns a snapshot of all masters' status via the "masters" array.
  */
-static int handle_status_command(char *response, size_t response_size)
+static int handle_status_command(ecat_reply_t *out)
 {
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "configured", g_master_count > 0);
@@ -1647,11 +1666,7 @@ static int handle_status_command(char *response, size_t response_size)
         cJSON_AddItemToArray(masters_arr, build_master_status_json(&g_masters[i]));
     }
 
-    char *json_str = cJSON_PrintUnformatted(resp);
-    if (json_str) {
-        snprintf(response, response_size, "%s", json_str);
-        free(json_str);
-    }
+    reply_set(out, cJSON_PrintUnformatted(resp));
     cJSON_Delete(resp);
 
     return 0;
@@ -1763,7 +1778,7 @@ static cJSON *build_master_diagnostics_json(ecat_master_instance_t *inst)
  *
  * Returns detailed diagnostic information for all masters via the "masters" array.
  */
-static int handle_diagnostics_command(char *response, size_t response_size)
+static int handle_diagnostics_command(ecat_reply_t *out)
 {
     cJSON *resp = cJSON_CreateObject();
 
@@ -1773,40 +1788,18 @@ static int handle_diagnostics_command(char *response, size_t response_size)
                              build_master_diagnostics_json(&g_masters[i]));
     }
 
-    char *json_str = cJSON_PrintUnformatted(resp);
-    if (json_str) {
-        snprintf(response, response_size, "%s", json_str);
-        free(json_str);
-    }
+    reply_set(out, cJSON_PrintUnformatted(resp));
     cJSON_Delete(resp);
 
     return 0;
 }
 
-static int print_json(cJSON *resp, char *response, size_t response_size)
-{
-    char *json_str = cJSON_PrintUnformatted(resp);
-    int rc = 0;
-    if (json_str == NULL) {
-        snprintf(response, response_size, "{\"error\":\"out of memory\"}");
-        rc = -1;
-    } else if (strlen(json_str) >= response_size) {
-        snprintf(response, response_size, "{\"error\":\"response too large\"}");
-        rc = -1;
-    } else {
-        snprintf(response, response_size, "%s", json_str);
-    }
-    free(json_str);
-    cJSON_Delete(resp);
-    return rc;
-}
-
-static int handle_configure_command(cJSON *root, char *response, size_t response_size)
+static int handle_configure_command(cJSON *root, ecat_reply_t *out)
 {
     cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
     cJSON *path = params ? cJSON_GetObjectItemCaseSensitive(params, "path") : NULL;
     if (path != NULL && !cJSON_IsString(path)) {
-        snprintf(response, response_size, "{\"error\":\"'path' must be a string\"}");
+        reply_printf(out, "{\"error\":\"'path' must be a string\"}");
         return -1;
     }
 
@@ -1814,7 +1807,7 @@ static int handle_configure_command(cJSON *root, char *response, size_t response
     if (ecat_bus_configure(path ? path->valuestring : NULL, err, sizeof(err)) != 0) {
         cJSON *resp = cJSON_CreateObject();
         cJSON_AddStringToObject(resp, "error", err);
-        print_json(resp, response, response_size);
+        reply_json(out, resp);
         return -1;
     }
 
@@ -1828,32 +1821,33 @@ static int handle_configure_command(cJSON *root, char *response, size_t response
         cJSON_AddStringToObject(m, "name", inst->name);
         cJSON_AddStringToObject(m, "interface", inst->config.master.interface);
         cJSON_AddNumberToObject(m, "cycle_time_us", inst->config.master.cycle_time_us);
+        cJSON_AddNumberToObject(m, "task_priority", inst->config.master.task_priority);
         cJSON_AddNumberToObject(m, "slave_count", inst->config.slave_count);
         cJSON_AddItemToArray(masters, m);
     }
-    return print_json(resp, response, response_size);
+    return reply_json(out, resp);
 }
 
-static int handle_start_command(char *response, size_t response_size)
+static int handle_start_command(ecat_reply_t *out)
 {
     char err[512];
     int started = ecat_bus_start(err, sizeof(err));
     cJSON *resp = cJSON_CreateObject();
     if (started < 0) {
         cJSON_AddStringToObject(resp, "error", err);
-        print_json(resp, response, response_size);
+        reply_json(out, resp);
         return -1;
     }
     cJSON_AddStringToObject(resp, "status", "success");
     cJSON_AddNumberToObject(resp, "started", started);
     cJSON_AddNumberToObject(resp, "total", g_master_count);
-    return print_json(resp, response, response_size);
+    return reply_json(out, resp);
 }
 
-static int handle_stop_command(char *response, size_t response_size)
+static int handle_stop_command(ecat_reply_t *out)
 {
     ecat_bus_stop();
-    snprintf(response, response_size, "{\"status\":\"success\"}");
+    reply_printf(out, "{\"status\":\"success\"}");
     return 0;
 }
 
@@ -1863,7 +1857,7 @@ static bool master_has_layout(ecat_master_instance_t *inst)
     return state == ECAT_STATE_OPERATIONAL || state == ECAT_STATE_RECOVERING;
 }
 
-static int handle_layout_command(char *response, size_t response_size)
+static int handle_layout_command(ecat_reply_t *out)
 {
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddStringToObject(resp, "status", "success");
@@ -1897,15 +1891,15 @@ static int handle_layout_command(char *response, size_t response_size)
         }
         cJSON_AddItemToArray(masters, m);
     }
-    return print_json(resp, response, response_size);
+    return reply_json(out, resp);
 }
 
-static int handle_open_data_command(cJSON *root, char *response, size_t response_size)
+static int handle_open_data_command(cJSON *root, ecat_reply_t *out)
 {
     cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
     cJSON *endpoint = params ? cJSON_GetObjectItemCaseSensitive(params, "endpoint") : NULL;
     if (endpoint == NULL || !cJSON_IsString(endpoint)) {
-        snprintf(response, response_size, "{\"error\":\"missing 'endpoint' param\"}");
+        reply_printf(out, "{\"error\":\"missing 'endpoint' param\"}");
         return -1;
     }
 
@@ -1923,7 +1917,7 @@ static int handle_open_data_command(cJSON *root, char *response, size_t response
                            &session, err, sizeof(err)) != 0) {
             cJSON_Delete(masters);
             cJSON_AddStringToObject(resp, "error", err);
-            print_json(resp, response, response_size);
+            reply_json(out, resp);
             return -1;
         }
         char session_hex[17];
@@ -1939,69 +1933,78 @@ static int handle_open_data_command(cJSON *root, char *response, size_t response
     if (opened == 0) {
         cJSON_Delete(masters);
         cJSON_AddStringToObject(resp, "error", "no master is running; start the bus first");
-        print_json(resp, response, response_size);
+        reply_json(out, resp);
         return -1;
     }
     cJSON_AddStringToObject(resp, "status", "success");
     cJSON_AddItemToObject(resp, "masters", masters);
-    return print_json(resp, response, response_size);
+    return reply_json(out, resp);
 }
 
-static int handle_close_data_command(char *response, size_t response_size)
+static int handle_close_data_command(ecat_reply_t *out)
 {
     for (int i = 0; i < g_master_count; i++)
         ecat_data_close(&g_masters[i]);
-    snprintf(response, response_size, "{\"status\":\"success\"}");
+    reply_printf(out, "{\"status\":\"success\"}");
     return 0;
 }
 
-int ecat_bus_command(const char *command_json, char *response, size_t response_size)
+static int bus_command(const char *command_json, ecat_reply_t *out)
 {
     cJSON *root = cJSON_Parse(command_json);
     if (!root) {
-        snprintf(response, response_size, "{\"error\":\"invalid JSON\"}");
+        reply_printf(out, "{\"error\":\"invalid JSON\"}");
         return -1;
     }
 
     cJSON *cmd = cJSON_GetObjectItemCaseSensitive(root, "command");
     if (!cmd || !cJSON_IsString(cmd)) {
         cJSON_Delete(root);
-        snprintf(response, response_size, "{\"error\":\"missing 'command' field\"}");
+        reply_printf(out, "{\"error\":\"missing 'command' field\"}");
         return -1;
     }
 
     int result = -1;
     const char *name = cmd->valuestring;
     if (strcmp(name, "scan") == 0) {
-        result = handle_scan_command(root, response, response_size);
+        result = handle_scan_command(root, out);
     } else if (strcmp(name, "list-interfaces") == 0) {
-        result = handle_list_interfaces_command(response, response_size);
+        result = handle_list_interfaces_command(out);
     } else if (strcmp(name, "test") == 0) {
-        result = handle_test_command(root, response, response_size);
+        result = handle_test_command(root, out);
     } else if (strcmp(name, "status") == 0) {
-        result = handle_status_command(response, response_size);
+        result = handle_status_command(out);
     } else if (strcmp(name, "diagnostics") == 0) {
-        result = handle_diagnostics_command(response, response_size);
+        result = handle_diagnostics_command(out);
     } else if (strcmp(name, "configure") == 0) {
-        result = handle_configure_command(root, response, response_size);
+        result = handle_configure_command(root, out);
     } else if (strcmp(name, "start") == 0) {
-        result = handle_start_command(response, response_size);
+        result = handle_start_command(out);
     } else if (strcmp(name, "stop") == 0) {
-        result = handle_stop_command(response, response_size);
+        result = handle_stop_command(out);
     } else if (strcmp(name, "layout") == 0) {
-        result = handle_layout_command(response, response_size);
+        result = handle_layout_command(out);
     } else if (strcmp(name, "open_data") == 0) {
-        result = handle_open_data_command(root, response, response_size);
+        result = handle_open_data_command(root, out);
     } else if (strcmp(name, "close_data") == 0) {
-        result = handle_close_data_command(response, response_size);
+        result = handle_close_data_command(out);
     } else {
         cJSON *resp = cJSON_CreateObject();
         char msg[160];
         snprintf(msg, sizeof(msg), "unknown command '%.64s'", name);
         cJSON_AddStringToObject(resp, "error", msg);
-        print_json(resp, response, response_size);
+        reply_json(out, resp);
     }
 
     cJSON_Delete(root);
     return result;
+}
+
+char *ecat_bus_command(const char *command_json)
+{
+    ecat_reply_t out = { NULL };
+    bus_command(command_json, &out);
+    if (out.text == NULL)
+        reply_printf(&out, "{\"error\":\"no reply\"}");
+    return out.text;
 }

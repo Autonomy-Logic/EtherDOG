@@ -11,8 +11,8 @@ Protocol version: **1**.
 
 | Channel | Spec | Notes |
 |---|---|---|
-| Control | `unix:<path>` | Linux default `unix:/run/etherdog/etherdog.socket`. The socket is created with mode `0600`. |
-| Control | `tcp:<loopback ip>:<port>` | Windows (MSYS2) default `tcp:127.0.0.1:18444`. Only loopback addresses are accepted. |
+| Control | `unix:<path>` | Default `unix:/run/etherdog/etherdog.socket`, on Linux and Windows (MSYS2). Created with mode `0600`; peers are checked by user id (see Access). |
+| Control | `tcp:<loopback ip>:<port>` | Only loopback addresses are accepted. Requires a token. |
 | Data | `unix:<path>` | Datagram socket. The client binds it before `open_data`. Not available on Windows (MSYS2). |
 | Data | `udp:<loopback ip>:<port>` | Only loopback addresses are accepted. |
 
@@ -20,9 +20,13 @@ Protocol version: **1**.
 
 Each request is a JSON object on one line: `{"command": "<name>", "params": {...}}`. Each reply is a JSON object on one line. A failed request carries an `"error"` string; a successful one usually carries `"status": "success"`. Requests on one connection are answered in order.
 
-### Authentication
+### Access
 
-When EtherDOG is started with a token (`--token-file` or `$ETHERDOG_TOKEN`), the first request on every connection must be:
+On a unix control socket, EtherDOG asks the operating system who is connecting (`SO_PEERCRED`) and accepts only its own user, root, and any `--allow-uid <uid>`. Other connections get `{"error": "permission denied"}` and are closed. A tcp socket carries no peer identity, so EtherDOG refuses to open one without a token.
+
+### Token
+
+A token is optional on a unix socket and mandatory on tcp. It is passed on the first line of stdin (`--token-stdin`) or in `$ETHERDOG_TOKEN`, never on the command line, where other users can read it. With a token, the first request on every connection must be:
 
 ```json
 {"command": "hello", "params": {"token": "<token>"}}
@@ -38,7 +42,7 @@ Any other first request, or a wrong token, gets an error and the connection is c
 
 | Command | Params | Effect |
 |---|---|---|
-| `configure` | `path` (optional) | Load a bus configuration file ([BUSCONFIG.md](BUSCONFIG.md)), replacing the current one. Refused while the bus runs. Without `path`, clears the configuration. The reply lists the masters (`index`, `name`, `interface`, `cycle_time_us`, `slave_count`). |
+| `configure` | `path` (optional) | Load a bus configuration file ([BUSCONFIG.md](BUSCONFIG.md)), replacing the current one. Refused while the bus runs. Without `path`, clears the configuration. The reply lists the masters (`index`, `name`, `interface`, `cycle_time_us`, `task_priority`, `slave_count`). |
 | `start` | none | Brings every master to OPERATIONAL. Safe to repeat. The reply gives `started` and `total`. |
 | `stop` | none | Drives the outputs to zero, moves the slaves to INIT, closes the data sessions. |
 | `shutdown` | none | Stops the bus and exits the process. |

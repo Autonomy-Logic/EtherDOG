@@ -44,11 +44,10 @@ bool ecat_bus_any_active(void);
 /**
  * @brief Run one JSON command ({"command": "...", "params": {...}}).
  *
- * The response is always a JSON object written into @p response; failures carry an
- * "error" key. Command set: docs/PROTOCOL.md.
+ * The reply is a JSON object; failures carry an "error" key. Command set: docs/PROTOCOL.md.
  *
- * @return 0 on success, -1 on failure.
+ * @return the reply, heap-allocated (caller frees), or NULL when out of memory.
  */
-int ecat_bus_command(const char *command_json, char *response, size_t response_size);
+char *ecat_bus_command(const char *command_json);
 
 #endif /* EDOG_BUS_H */

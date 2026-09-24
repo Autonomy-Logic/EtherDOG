@@ -34,8 +34,9 @@ sudo ./build/etherdog --config examples/ek1818_busconfig.json --start
 
 | Option | Default |
 |---|---|
-| `--control <spec>` | `unix:/run/etherdog/etherdog.socket` (`tcp:127.0.0.1:18444` on Windows) |
-| `--token-file <path>` | none. Also read from `$ETHERDOG_TOKEN`. When set, clients must authenticate. |
+| `--control <spec>` | `unix:/run/etherdog/etherdog.socket` |
+| `--allow-uid <uid>` | none. Unix socket clients must run as EtherDOG's user, root, or one of these. |
+| `--token-stdin` | off. Reads a token from stdin (or `$ETHERDOG_TOKEN`); clients must send it. Required for `tcp:`. |
 | `--state-dir <dir>` | `/run/etherdog` |
 | `--config <file>` | none |
 | `--start` | start the bus after loading `--config` |

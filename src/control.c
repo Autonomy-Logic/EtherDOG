@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Autonomy®
 
+#define _GNU_SOURCE /* struct ucred */
+
 #include "control.h"
 #include "bus.h"
 #include "log.h"
@@ -18,12 +20,13 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #define MAX_CLIENTS 8
 #define MAX_LINE (64 * 1024)
-#define RESPONSE_SIZE (512 * 1024)
+#define MAX_ALLOWED_UIDS 8
 
 typedef struct {
     int fd;
@@ -34,8 +37,10 @@ typedef struct {
 
 static edog_logger_t g_log;
 static client_t g_clients[MAX_CLIENTS];
-static char g_response[RESPONSE_SIZE];
 static char g_unix_path[108];
+static bool g_unix_listener;
+static uid_t g_allowed_uids[MAX_ALLOWED_UIDS + 2];
+static int g_allowed_count;
 
 static bool constant_time_equals(const char *a, const char *b)
 {
@@ -72,6 +77,7 @@ static int open_listener(const char *spec)
         }
         chmod(addr.sun_path, 0600);
         snprintf(g_unix_path, sizeof(g_unix_path), "%s", addr.sun_path);
+        g_unix_listener = true;
         edog_log_info(&g_log, "control socket: unix:%s", path);
         return fd;
     }
@@ -116,6 +122,31 @@ static int open_listener(const char *spec)
     return -1;
 }
 
+/* Unix socket peers must run as an allowed user; the kernel (or Cygwin) vouches for the uid. */
+static bool peer_allowed(int fd, uid_t *uid_out)
+{
+#if defined(SO_PEERCRED)
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || len != sizeof(cred))
+        return false;
+    uid_t uid = cred.uid;
+#elif defined(__APPLE__)
+    uid_t uid;
+    gid_t gid;
+    if (getpeereid(fd, &uid, &gid) != 0)
+        return false;
+#else
+    return false;
+#endif
+    *uid_out = uid;
+    for (int i = 0; i < g_allowed_count; i++) {
+        if (g_allowed_uids[i] == uid)
+            return true;
+    }
+    return false;
+}
+
 static void send_all(int fd, const char *data, size_t len)
 {
     while (len > 0) {
@@ -145,15 +176,17 @@ static void drop_client(client_t *c)
     c->used = 0;
 }
 
-static void hello_response(void)
+static void hello_response(client_t *c)
 {
-    snprintf(g_response, sizeof(g_response),
+    char text[160];
+    snprintf(text, sizeof(text),
              "{\"status\":\"success\",\"name\":\"EtherDOG\",\"version\":\"%s\",\"protocol\":%d}",
              EDOG_VERSION, EDOG_PROTOCOL_VERSION);
+    reply(c, text);
 }
 
 /* {"command":"logs","params":{"min_id":N,"level":"info","max":500}} */
-static void logs_response(cJSON *root)
+static void logs_response(client_t *c, cJSON *root)
 {
     cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
     cJSON *min_id = params ? cJSON_GetObjectItemCaseSensitive(params, "min_id") : NULL;
@@ -162,7 +195,7 @@ static void logs_response(cJSON *root)
 
     edog_log_level_t min_level = EDOG_LOG_DEBUG;
     if (cJSON_IsString(level) && !edog_log_parse_level(level->valuestring, &min_level)) {
-        snprintf(g_response, sizeof(g_response), "{\"error\":\"unknown level\"}");
+        reply(c, "{\"error\":\"unknown level\"}");
         return;
     }
     int limit = cJSON_IsNumber(max) ? max->valueint : 500;
@@ -189,7 +222,7 @@ static void logs_response(cJSON *root)
         cJSON_AddItemToArray(arr, e);
     }
     char *text = cJSON_PrintUnformatted(resp);
-    snprintf(g_response, sizeof(g_response), "%s", text ? text : "{\"error\":\"out of memory\"}");
+    reply(c, text ? text : "{\"error\":\"out of memory\"}");
     free(text);
     cJSON_Delete(resp);
 }
@@ -213,8 +246,7 @@ static bool handle_line(client_t *c, const char *line, const char *token)
             return false;
         }
         c->authenticated = true;
-        hello_response();
-        reply(c, g_response);
+        hello_response(c);
         cJSON_Delete(root);
         return false;
     }
@@ -227,8 +259,7 @@ static bool handle_line(client_t *c, const char *line, const char *token)
     }
 
     if (name != NULL && strcmp(name, "logs") == 0) {
-        logs_response(root);
-        reply(c, g_response);
+        logs_response(c, root);
         cJSON_Delete(root);
         return false;
     }
@@ -240,8 +271,9 @@ static bool handle_line(client_t *c, const char *line, const char *token)
     }
     cJSON_Delete(root);
 
-    ecat_bus_command(line, g_response, sizeof(g_response));
-    reply(c, g_response);
+    char *text = ecat_bus_command(line);
+    reply(c, text ? text : "{\"error\":\"out of memory\"}");
+    free(text);
     return false;
 }
 
@@ -280,11 +312,26 @@ static bool service_client(client_t *c, const char *token)
     return exit_now;
 }
 
-int edog_control_run(const char *listen_spec, const char *token, volatile sig_atomic_t *stop)
+int edog_control_run(const char *listen_spec, const char *token, const uid_t *allow_uids,
+                     int allow_count, volatile sig_atomic_t *stop)
 {
     edog_logger_init(&g_log, "CONTROL");
     for (int i = 0; i < MAX_CLIENTS; i++)
         g_clients[i].fd = -1;
+
+    if (strncmp(listen_spec, "tcp:", 4) == 0 && (token == NULL || token[0] == '\0')) {
+        edog_log_error(&g_log, "a tcp control socket needs a token (--token-stdin or $ETHERDOG_TOKEN)");
+        return -1;
+    }
+    if (allow_count > MAX_ALLOWED_UIDS) {
+        edog_log_error(&g_log, "at most %d --allow-uid values", MAX_ALLOWED_UIDS);
+        return -1;
+    }
+    g_allowed_count = 0;
+    g_allowed_uids[g_allowed_count++] = geteuid();
+    g_allowed_uids[g_allowed_count++] = 0;
+    for (int i = 0; i < allow_count; i++)
+        g_allowed_uids[g_allowed_count++] = allow_uids[i];
 
     int lfd = open_listener(listen_spec);
     if (lfd < 0)
@@ -318,6 +365,14 @@ int edog_control_run(const char *listen_spec, const char *token, volatile sig_at
 
         if (pfd[0].revents & POLLIN) {
             int cfd = accept(lfd, NULL, NULL);
+            uid_t uid = (uid_t)-1;
+            if (cfd >= 0 && g_unix_listener && !peer_allowed(cfd, &uid)) {
+                edog_log_warn(&g_log, "refused a control connection from uid %ld", (long)uid);
+                const char *denied = "{\"error\":\"permission denied\"}\n";
+                send_all(cfd, denied, strlen(denied));
+                close(cfd);
+                cfd = -1;
+            }
             if (cfd >= 0) {
                 int slot = -1;
                 for (int i = 0; i < MAX_CLIENTS; i++) {

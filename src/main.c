@@ -23,11 +23,8 @@
 #include <sys/mman.h>
 #endif
 
-#if defined(__CYGWIN__) || defined(_WIN32)
-#define DEFAULT_CONTROL "tcp:127.0.0.1:18444"
-#else
 #define DEFAULT_CONTROL "unix:/run/etherdog/etherdog.socket"
-#endif
+#define MAX_ALLOW_UIDS 8
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -51,8 +48,11 @@ static void usage(FILE *out)
             "Usage: etherdog [options]\n"
             "  --control <spec>     control socket: unix:<path> or tcp:127.0.0.1:<port>\n"
             "                       (default %s)\n"
-            "  --token-file <path>  require clients to authenticate with this token\n"
-            "                       (also read from $ETHERDOG_TOKEN)\n"
+            "  --allow-uid <uid>    also accept unix socket clients running as this uid\n"
+            "                       (EtherDOG's own uid and root are always accepted)\n"
+            "  --token-stdin        read a token from the first line of stdin and require\n"
+            "                       clients to send it in 'hello' (also $ETHERDOG_TOKEN);\n"
+            "                       mandatory for a tcp control socket\n"
             "  --state-dir <dir>    data sockets and NIC recovery files (default /run/etherdog)\n"
             "  --config <file>      load a bus configuration at startup\n"
             "  --start              start the bus after loading --config\n"
@@ -63,14 +63,11 @@ static void usage(FILE *out)
             EDOG_VERSION, DEFAULT_CONTROL);
 }
 
-static int read_token_file(const char *path, char *out, size_t size)
+static int read_token_line(FILE *in, char *out, size_t size)
 {
-    FILE *fp = fopen(path, "r");
-    if (fp == NULL)
+    if (fgets(out, (int)size, in) == NULL)
         return -1;
-    size_t n = fread(out, 1, size - 1, fp);
-    fclose(fp);
-    out[n] = '\0';
+    size_t n = strlen(out);
     while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' '))
         out[--n] = '\0';
     return n > 0 ? 0 : -1;
@@ -96,7 +93,9 @@ static void install_signals(void)
 int main(int argc, char **argv)
 {
     const char *control = DEFAULT_CONTROL;
-    const char *token_file = NULL;
+    int token_stdin = 0;
+    uid_t allow_uids[MAX_ALLOW_UIDS];
+    int allow_count = 0;
     const char *state_dir = "/run/etherdog";
     const char *config = NULL;
     const char *log_socket = NULL;
@@ -117,8 +116,16 @@ int main(int argc, char **argv)
         } else if (next != NULL && strcmp(a, "--control") == 0) {
             control = next;
             i++;
-        } else if (next != NULL && strcmp(a, "--token-file") == 0) {
-            token_file = next;
+        } else if (strcmp(a, "--token-stdin") == 0) {
+            token_stdin = 1;
+        } else if (next != NULL && strcmp(a, "--allow-uid") == 0) {
+            char *end = NULL;
+            long uid = strtol(next, &end, 10);
+            if (end == next || *end != '\0' || uid < 0 || allow_count >= MAX_ALLOW_UIDS) {
+                fprintf(stderr, "invalid --allow-uid '%s' (at most %d)\n", next, MAX_ALLOW_UIDS);
+                return 2;
+            }
+            allow_uids[allow_count++] = (uid_t)uid;
             i++;
         } else if (next != NULL && strcmp(a, "--state-dir") == 0) {
             state_dir = next;
@@ -152,10 +159,10 @@ int main(int argc, char **argv)
 
     char token[256] = "";
     const char *env_token = getenv("ETHERDOG_TOKEN");
-    if (token_file != NULL) {
-        if (read_token_file(token_file, token, sizeof(token)) != 0) {
-            edog_log_error(&log, "cannot read token file %s", token_file);
-            return 1;
+    if (token_stdin) {
+        if (read_token_line(stdin, token, sizeof(token)) != 0) {
+            edog_log_error(&log, "--token-stdin: no token on stdin");
+            return 2;
         }
     } else if (env_token != NULL && env_token[0] != '\0') {
         snprintf(token, sizeof(token), "%s", env_token);
@@ -175,8 +182,8 @@ int main(int argc, char **argv)
                       strerror(errno));
 #endif
 
-    edog_log_info(&log, "EtherDOG %s starting (auth %s)", EDOG_VERSION,
-                  token[0] ? "required" : "disabled");
+    edog_log_info(&log, "EtherDOG %s starting (token %s)", EDOG_VERSION,
+                  token[0] ? "required" : "not required");
 
     ecat_bus_init();
     ecat_bus_set_state_dir(state_dir);
@@ -191,7 +198,7 @@ int main(int argc, char **argv)
             edog_log_error(&log, "%s", err);
     }
 
-    int rc = edog_control_run(control, token, &g_stop);
+    int rc = edog_control_run(control, token, allow_uids, allow_count, &g_stop);
 
     edog_log_info(&log, "shutting down");
     ecat_bus_shutdown();
