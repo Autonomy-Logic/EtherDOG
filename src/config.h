@@ -353,6 +353,9 @@ ecat_data_type_t ecat_parse_data_type(const char *str);
 /** Background monitor thread polling interval in milliseconds */
 #define ECAT_MONITOR_INTERVAL_MS    500
 
+/** Consecutive AL status replies not all-OP before triggering recovery */
+#define ECAT_AL_FAULT_THRESHOLD     3
+
 /**
  * @brief Per-master bus state machine
  *
@@ -535,42 +538,42 @@ typedef struct {
     ecat_cycle_diag_t diag;
     _Atomic(int) consecutive_wkc_errors;
     _Atomic(int) recovery_attempts;
-    /* Counts ecx_writestate calls during recovery that returned wkc<=0
-     * (request did not reach the slave -- link/cable issue, vs. slave
-     * reachable but rejecting the state).  Distinguishes physical from
-     * configuration recovery failures in the operator UI. */
+    /* Recovery writestate calls with wkc<=0: slave unreachable, not rejecting the state. */
     _Atomic(uint32_t) recovery_writestate_failures;
     uint64_t cycle_counter;
 
-    /* Per-slave snapshot for status queries. slavelist[] is mutated by the monitor during
-     * recovery; the monitor publishes the fields queries need here under slaves_mutex, so a
-     * query never takes soem_lock and never costs the bus thread a cycle. */
+    /* Cycles that ended past the next deadline. */
+    _Atomic(uint64_t) overruns;
+
+    /* AL status poll: one BRD per cycle, collected the next cycle. Bus thread only writes. */
+    int                al_poll_idx;                /* pending frame index, -1 when none */
+    int                consecutive_al_faults;
+    _Atomic(uint16_t)  al_status;                  /* OR of every slave's AL status     */
+    _Atomic(int)       al_wkc;                     /* slaves that answered              */
+    _Atomic(uint64_t)  al_replies;
+    _Atomic(uint64_t)  al_misses;
+    _Atomic(uint64_t)  al_faults;                  /* replies not all-OP or short       */
+    _Atomic(uint32_t)  recovery_al_trigger;        /* 0: WKC; else 0x10000 | AL status  */
+
+    /* Snapshot for status queries; the monitor owns slavelist[] and publishes here. */
     ecat_slave_status_t slaves_snapshot[ECAT_MAX_SLAVES];
     int                 slaves_snapshot_count;
     pthread_mutex_t     slaves_mutex;
 
 #if ECAT_ENABLE_MONITOR_THREAD
-    /* Monitor thread. soem_lock serializes SOEM access between the bus thread (trylock, skips
-     * the cycle on contention) and the monitor (state checks, recovery). PRIO_INHERIT. */
+    /* Monitor thread: state checks, recovery, mailbox. Never blocks the bus thread. */
     pthread_t monitor_thread;
     _Atomic(bool) monitor_running;
-    pthread_mutex_t soem_lock;
-    _Atomic(uint64_t) exchange_skips;
 #endif
 
     /* Dedicated bus thread: periodic at master.cycle_time_us, SCHED_FIFO at task_priority. */
     pthread_t              bus_thread;
     _Atomic(bool)          bus_running;
 
-    /* Time-based EWMA window in samples; computed from cycle_time_us at
-     * start_single_master so the wall-clock smoothing window matches
-     * ECAT_AVG_TARGET_WINDOW_NS regardless of configured cycle rate. */
+    /* EWMA window in samples, sized from cycle_time_us to span ECAT_AVG_TARGET_WINDOW_NS. */
     int64_t                avg_window;
 
-    /* Per-iface external state (NIC tuning + IP-stack isolation).
-     * Populated by ecat_iface_state_apply(); consumed by
-     * ecat_iface_state_revert().  Includes its own iface name copy so
-     * revert can run after config has been freed. */
+    /* NIC tuning and IP isolation to revert on close; keeps its own iface name copy. */
     ecat_iface_state_t iface_state;
 } ecat_master_instance_t;
 

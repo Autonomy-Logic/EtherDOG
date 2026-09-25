@@ -12,7 +12,9 @@
  *   1. apply the newest output frame from the client into the IOmap (or the safe state)
  *   2. SOEM exchange
  *   3. send the input region to the client as one datagram
- * All three run under soem_lock; the monitor thread takes it for state checks and recovery.
+ *   4. collect the previous AL status poll and send the next one
+ * The bus thread takes no lock the monitor holds across a round trip: SOEM serializes the socket
+ * per frame, and the monitor owns slavelist[].
  */
 
 /* _GNU_SOURCE: pthread_setname_np() for thread naming. Must precede system headers. */
@@ -166,13 +168,8 @@ static char g_state_dir[256] = EDOG_DEFAULT_STATE_DIR;
 /**
  * @brief Build and publish a snapshot of per-slave AL state.
  *
- * Reads from ecx_context.slavelist[] and config.slaves[] into a stack
- * array, then memcpy-publishes under slaves_mutex.  The caller must
- * hold soem_lock when calling this (the read of slavelist[] races with
- * monitor recovery otherwise).
- *
- * Counters/timing are NOT cached here -- consumers (build_master_*_json)
- * read them lock-free via atomic_load directly from inst->diag.
+ * Copies slavelist[] states into the snapshot under slaves_mutex. Called by the monitor thread,
+ * or before it exists. Counters are not cached here; queries read them from inst->diag.
  */
 static void publish_slaves_snapshot(ecat_master_instance_t *inst)
 {
@@ -205,8 +202,6 @@ static void publish_slaves_snapshot(ecat_master_instance_t *inst)
 }
 
 #if ECAT_ENABLE_MONITOR_THREAD
-/* Monitor-thread mailbox drain: in steady OP nothing reads SM1, so CoE emergencies wait there until
- * ecx_mbxhandler runs. Its queued errors are then popped and logged. */
 
 /** Map ec_err_type to a short human-readable tag for log lines. */
 static const char *ecat_err_type_name(ec_err_type t)
@@ -269,15 +264,8 @@ static void log_ecat_error(const ecat_master_instance_t *inst, const ec_errort *
 /**
  * @brief Drain SM1 mailboxes and SOEM's internal error queue.
  *
- * Acquires soem_lock briefly, calls ecx_mbxhandler to dispatch any pending
- * mailbox traffic (SOEM internally pushes CoE Emergencies into elist when
- * it sees them), then pops the queued errors into a local buffer and
- * releases the lock before logging -- the logger does a synchronous
- * socket write that we don't want under soem_lock.
- *
- * Caller is the monitor thread.  No-op when SOEM is not initialized so a
- * future refactor that reorders stop (close before join) cannot turn this
- * into use-after-close on the raw socket.
+ * Runs ecx_mbxhandler (CoE emergencies land in SOEM's error list), then pops and logs the errors.
+ * Monitor thread only; no-op when SOEM is not initialized.
  */
 static void drain_mailbox_and_errors(ecat_master_instance_t *inst)
 {
@@ -288,16 +276,12 @@ static void drain_mailbox_and_errors(ecat_master_instance_t *inst)
     ec_errort errors[EC_MAXELIST];
     int err_count = 0;
 
-    pthread_mutex_lock(&inst->soem_lock);
-    /* limit=8 caps work per call -- mbxhandler iterates queued mailbox
-     * operations across the group; the cap keeps the lock window bounded
-     * even when traffic is bursty. */
+    /* At most 8 mailboxes per pass */
     ecx_mbxhandler(&inst->ecx_context, 0, 8);
     while (err_count < EC_MAXELIST &&
            ecx_poperror(&inst->ecx_context, &errors[err_count])) {
         err_count++;
     }
-    pthread_mutex_unlock(&inst->soem_lock);
 
     for (int i = 0; i < err_count; i++)
         log_ecat_error(inst, &errors[i]);
@@ -312,45 +296,33 @@ static void drain_mailbox_and_errors(ecat_master_instance_t *inst)
 /**
  * @brief Attempt to recover all slaves that are not in OP
  *
- * Takes soem_lock per slave with a yield in between, so the bus thread keeps exchanging.
+ * Runs beside the bus thread, which keeps exchanging with the healthy slaves.
  *
  * @param inst Per-master instance
  * @return 1 if all slaves back in OP, 0 if some still recovering, -1 on max attempts
  */
 static int attempt_recovery(ecat_master_instance_t *inst)
 {
-    /* Initial state read under lock so cycle_start_single never sees
-     * a slavelist[] mid-update. */
-    pthread_mutex_lock(&inst->soem_lock);
     ecat_master_read_states(inst);
-    pthread_mutex_unlock(&inst->soem_lock);
 
     int all_ok = 1;
-
-    /* Gap between per-slave lock holds, so the bus thread's trylock gets a window each cycle. */
-    const struct timespec yield = { 0, 1000 * 1000 };  /* 1 ms */
 
     for (int i = 0; i < inst->config.slave_count; i++) {
         int pos = inst->config.slaves[i].position;
 
-        pthread_mutex_lock(&inst->soem_lock);
         uint16_t state = ecat_master_get_slave_state(inst, pos);
-        /* 0 = no recovery needed (slave already in OP); only set to a
-         * negative value if ecat_master_recover_slave reports an error. */
+        /* 0: already in OP; negative: recovery error */
         int result = 0;
         if (state != EC_STATE_OPERATIONAL) {
             all_ok = 0;
             result = ecat_master_recover_slave(inst, pos, &g_logger);
         }
-        pthread_mutex_unlock(&inst->soem_lock);
 
         if (result < 0) {
             edog_log_error(&g_logger,
                 "Master '%s': Slave %d (%s): recovery error",
                 inst->name, pos, inst->config.slaves[i].name);
         }
-
-        nanosleep(&yield, NULL);
     }
 
     if (all_ok) {
@@ -363,8 +335,7 @@ static int attempt_recovery(ecat_master_instance_t *inst)
         return 1;
     }
 
-    /* Single-writer (monitor thread) — fetch_add not needed; load+store is
-     * sufficient and communicates the ownership model. */
+    /* Single writer (monitor thread) */
     int attempts = atomic_load_explicit(&inst->recovery_attempts,
                                         memory_order_relaxed) + 1;
     atomic_store_explicit(&inst->recovery_attempts, attempts,
@@ -392,14 +363,13 @@ static int attempt_recovery(ecat_master_instance_t *inst)
 /**
  * @brief Background thread for slave state monitoring, recovery, and logging.
  *
- * Runs at default (non-RT) priority.  Periodically:
- *   - Acquires inst->soem_lock (the bus thread skips a cycle while it is held).
- *   - Reads slave states via ecx_readstate() and publishes the slaves
- *     snapshot.
- *   - Performs recovery if in RECOVERING state.
- *   - Emits user-facing log messages on state and counter transitions
- *     so the bus thread never calls edog_log_* (which serialises
- *     on a global mutex and writes synchronously to a Unix socket).
+ * Runs at default (non-RT) priority. Periodically:
+ *   - refreshes slave states: from the cyclic AL poll while it shows all slaves in OP,
+ *     otherwise with ecx_readstate(); then publishes the slaves snapshot
+ *   - performs recovery in RECOVERING
+ *   - drains mailboxes
+ *   - logs state and counter transitions, so the bus thread never logs
+ * Its frames share the socket with the bus thread per frame; it never makes the bus thread wait.
  *
  * @param arg Pointer to the ecat_master_instance_t for this master
  */
@@ -410,6 +380,8 @@ static void *ecat_monitor_thread(void *arg)
     /* Log on transitions only; continuous metrics are served by status and diagnostics. */
     int last_logged_state = -1;
     int last_logged_consec_wkc = 0;
+    uint64_t last_al_replies = 0;
+    uint64_t last_al_faults = atomic_load(&inst->al_faults);
 
     edog_log_info(&g_logger,
         "Master '%s': monitor thread started (interval=%d ms)",
@@ -419,20 +391,20 @@ static void *ecat_monitor_thread(void *arg)
         int state = atomic_load(&inst->bus_state);
 
         if (state == ECAT_STATE_OPERATIONAL) {
-            /* Periodic state check.  Publish slaves snapshot while still
-             * holding the lock, so the read of slavelist[] is consistent. */
-            pthread_mutex_lock(&inst->soem_lock);
-            ecat_master_read_states(inst);
+            /* New replies and no faults since the last pass: all slaves in OP, no frame needed */
+            uint64_t replies = atomic_load(&inst->al_replies);
+            uint64_t faults = atomic_load(&inst->al_faults);
+            if (replies != last_al_replies && faults == last_al_faults)
+                ecat_master_mark_all_operational(inst);
+            else
+                ecat_master_read_states(inst);
+            last_al_replies = replies;
+            last_al_faults = faults;
             publish_slaves_snapshot(inst);
-            pthread_mutex_unlock(&inst->soem_lock);
 
         } else if (state == ECAT_STATE_RECOVERING) {
-            /* Per-slave locking inside; the snapshot takes the lock once afterwards. */
             int result = attempt_recovery(inst);
-
-            pthread_mutex_lock(&inst->soem_lock);
             publish_slaves_snapshot(inst);
-            pthread_mutex_unlock(&inst->soem_lock);
 
             if (result == 1) {
                 atomic_store(&inst->bus_state, ECAT_STATE_OPERATIONAL);
@@ -447,10 +419,7 @@ static void *ecat_monitor_thread(void *arg)
             }
         }
 
-        /* Drain SM1 mailboxes (CoE Emergencies, async SDO responses) and
-         * surface anything SOEM pushed into its internal error queue.
-         * Skip in ERROR/STOPPED -- mailbox state is undefined when slaves
-         * are not at least in PRE-OP. */
+        /* Mailboxes only while slaves are at least PRE-OP */
         int mbx_state = atomic_load(&inst->bus_state);
         if (mbx_state == ECAT_STATE_OPERATIONAL ||
             mbx_state == ECAT_STATE_RECOVERING) {
@@ -462,10 +431,17 @@ static void *ecat_monitor_thread(void *arg)
         int curr_state = atomic_load(&inst->bus_state);
         if (curr_state != last_logged_state) {
             if (curr_state == ECAT_STATE_RECOVERING) {
-                edog_log_warn(&g_logger,
-                    "Master '%s': WKC error threshold (%d) reached, "
-                    "[state: RECOVERING]",
-                    inst->name, ECAT_WKC_ERROR_THRESHOLD);
+                uint32_t al_trigger = atomic_load(&inst->recovery_al_trigger);
+                if (al_trigger == 0)
+                    edog_log_warn(&g_logger,
+                        "Master '%s': WKC error threshold (%d) reached, "
+                        "[state: RECOVERING]",
+                        inst->name, ECAT_WKC_ERROR_THRESHOLD);
+                else
+                    edog_log_warn(&g_logger,
+                        "Master '%s': AL status 0x%04X: not all slaves in OP, "
+                        "[state: RECOVERING]",
+                        inst->name, (unsigned)(al_trigger & 0xFFFF));
             }
             last_logged_state = curr_state;
         }
@@ -610,9 +586,7 @@ static int start_single_master(ecat_master_instance_t *inst)
     inst->cycle_counter = 0;
     diag_reset(&inst->diag);
 
-    /* Time-based EWMA window in samples — chosen so the wall-clock
-     * smoothing window matches ECAT_AVG_TARGET_WINDOW_NS regardless of
-     * the configured cycle rate. Same scheme as scan_cycle_tracker. */
+    /* EWMA window spanning ECAT_AVG_TARGET_WINDOW_NS at this cycle time */
     {
         int64_t cycle_ns = (int64_t)inst->config.master.cycle_time_us * 1000LL;
         inst->avg_window = (cycle_ns > 0)
@@ -620,6 +594,16 @@ static int start_single_master(ecat_master_instance_t *inst)
             : 1;
         if (inst->avg_window < 1) inst->avg_window = 1;
     }
+
+    atomic_store(&inst->overruns, 0);
+    inst->al_poll_idx = -1;
+    inst->consecutive_al_faults = 0;
+    atomic_store(&inst->al_status, 0);
+    atomic_store(&inst->al_wkc, 0);
+    atomic_store(&inst->al_replies, 0);
+    atomic_store(&inst->al_misses, 0);
+    atomic_store(&inst->al_faults, 0);
+    atomic_store(&inst->recovery_al_trigger, 0);
 
     atomic_store(&inst->bus_state, ECAT_STATE_OPERATIONAL);
 
@@ -630,9 +614,6 @@ static int start_single_master(ecat_master_instance_t *inst)
     publish_slaves_snapshot(inst);
 
 #if ECAT_ENABLE_MONITOR_THREAD
-    /* Start background monitor thread for state checks and recovery.
-     * soem_lock is initialized in init() once per instance. */
-    atomic_store(&inst->exchange_skips, 0);
     atomic_store(&inst->monitor_running, true);
 
     if (pthread_create(&inst->monitor_thread, NULL, ecat_monitor_thread, inst) != 0) {
@@ -643,12 +624,7 @@ static int start_single_master(ecat_master_instance_t *inst)
     }
 #endif
 
-    /* Per-iface external state (NIC tuning + IP isolation) is applied
-     * inside ecat_master_open_and_scan() and reverted inside
-     * ecat_master_close(). */
-
-    /* Spawn the dedicated bus thread. SCHED_FIFO + absolute clock_nanosleep
-     * driving the SOEM exchange at master.cycle_time_us. */
+    /* SCHED_FIFO, absolute clock_nanosleep at master.cycle_time_us */
     atomic_store(&inst->bus_running, true);
     if (pthread_create(&inst->bus_thread, NULL, ecat_bus_thread, inst) != 0) {
         edog_log_error(&g_logger,
@@ -688,9 +664,7 @@ static void stop_single_master(ecat_master_instance_t *inst)
         "Master '%s': Stopping (current state: %s)...",
         inst->name, ecat_state_to_string(state));
 
-    /* Stop the bus thread first so no further SOEM exchange races with
-     * teardown. Signal via the running flag, then SIGUSR1 to wake any
-     * in-flight clock_nanosleep, then join. */
+    /* Bus thread first; SIGUSR1 wakes its clock_nanosleep */
     if (atomic_load(&inst->bus_running)) {
         atomic_store(&inst->bus_running, false);
         pthread_kill(inst->bus_thread, SIGUSR1);
@@ -754,8 +728,7 @@ static void stop_single_master(ecat_master_instance_t *inst)
     ecat_master_close(inst, &g_logger);
     atomic_store(&inst->bus_state, ECAT_STATE_STOPPED);
 
-    /* Reset slaves snapshot: the bus is closed, AL states from the prior
-     * run are no longer meaningful.  Monitor is already joined. */
+    /* Bus closed: the old AL states mean nothing */
     pthread_mutex_lock(&inst->slaves_mutex);
     memset(inst->slaves_snapshot, 0, sizeof(inst->slaves_snapshot));
     inst->slaves_snapshot_count = 0;
@@ -773,35 +746,24 @@ static void stop_single_master(ecat_master_instance_t *inst)
  *   1. apply the newest output frame from the client (or the safe state) into the IOmap
  *   2. SOEM exchange
  *   3. send the input region to the client
- *   4. update WKC + diagnostics
+ *   4. collect the previous AL status poll, send the next one
+ *   5. update WKC + diagnostics
  *
- * The IOmap is only touched by this thread and the monitor, serialized by soem_lock.
+ * Only this thread touches the IOmap. It never waits on the monitor: SOEM locks the socket per
+ * frame, with priority inheritance on Linux.
  *
- * Returns true on a successful exchange, false on a skip (e.g. the
- * monitor thread holds exclusive SOEM access right now).
+ * Returns true on an exchange, false when the master is not exchanging.
  */
 static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
 {
     int state = atomic_load(&inst->bus_state);
-    /* RECOVERING is allowed: opportunistic exchange in the gaps between
-     * monitor recovery attempts.  exchange_skips counts trylock misses. */
+    /* RECOVERING keeps exchanging while the monitor recovers slaves */
     if (state != ECAT_STATE_OPERATIONAL && state != ECAT_STATE_RECOVERING)
         return false;
 
     uint8_t *iomap = ecat_master_get_iomap(inst);
     if (!iomap)
         return false;
-
-#if ECAT_ENABLE_MONITOR_THREAD
-    /* If the monitor thread is holding soem_lock (state check or recovery),
-     * yield this cycle.  The bus keeps running with stale I/O data for one
-     * cycle.  Trylock is non-blocking; in contention it costs only a futex
-     * read and returns immediately. */
-    if (pthread_mutex_trylock(&inst->soem_lock) != 0) {
-        atomic_fetch_add_explicit(&inst->exchange_skips, 1, memory_order_relaxed);
-        return false;
-    }
-#endif
 
     ec_timet t_exch_start, t_exch_end;
 
@@ -821,9 +783,26 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
     ecat_data_publish_inputs(inst, master_index, wkc, state == ECAT_STATE_OPERATIONAL,
                              wkc >= inst->expected_wkc);
 
-#if ECAT_ENABLE_MONITOR_THREAD
-    pthread_mutex_unlock(&inst->soem_lock);
-#endif
+    /* 4. AL status: the previous reply came in with this cycle's frames */
+    if (inst->al_poll_idx >= 0) {
+        uint16_t al_status = 0;
+        int al_wkc = 0;
+        if (ecat_master_al_poll_collect(inst, inst->al_poll_idx, &al_status, &al_wkc)) {
+            atomic_store_explicit(&inst->al_status, al_status, memory_order_relaxed);
+            atomic_store_explicit(&inst->al_wkc, al_wkc, memory_order_relaxed);
+            if (ecat_al_poll_healthy(al_status, al_wkc, inst->ecx_context.slavecount)) {
+                inst->consecutive_al_faults = 0;
+            } else {
+                inst->consecutive_al_faults++;
+                atomic_fetch_add_explicit(&inst->al_faults, 1, memory_order_relaxed);
+            }
+            /* Counted after faults: the monitor reads replies first */
+            atomic_fetch_add_explicit(&inst->al_replies, 1, memory_order_release);
+        } else {
+            atomic_fetch_add_explicit(&inst->al_misses, 1, memory_order_relaxed);
+        }
+    }
+    inst->al_poll_idx = ecat_master_al_poll_send(inst);
 
     inst->cycle_counter++;
 
@@ -863,22 +842,27 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
         atomic_store_explicit(&inst->diag.min_bus_cycle_ns, exchange_ns,
                               memory_order_relaxed);
 
-    /* WKC error tracking. No logging here: stderr writes would inject jitter. The monitor
-     * thread observes these counters and emits the user-facing messages. */
+    /* No logging here; the monitor reports these counters */
+    int consec = 0;
     if (wkc_error) {
-        int consec = atomic_fetch_add_explicit(&inst->consecutive_wkc_errors, 1,
-                                               memory_order_relaxed) + 1;
-#if ECAT_ENABLE_MONITOR_THREAD
-        if (state == ECAT_STATE_OPERATIONAL &&
-            consec >= ECAT_WKC_ERROR_THRESHOLD) {
-            atomic_store(&inst->bus_state, ECAT_STATE_RECOVERING);
-        }
-#else
-        (void)consec;
-#endif
+        consec = atomic_fetch_add_explicit(&inst->consecutive_wkc_errors, 1,
+                                           memory_order_relaxed) + 1;
     } else {
         atomic_store(&inst->consecutive_wkc_errors, 0);
     }
+#if ECAT_ENABLE_MONITOR_THREAD
+    if (state == ECAT_STATE_OPERATIONAL && consec >= ECAT_WKC_ERROR_THRESHOLD) {
+        atomic_store(&inst->recovery_al_trigger, 0);
+        atomic_store(&inst->bus_state, ECAT_STATE_RECOVERING);
+    } else if (state == ECAT_STATE_OPERATIONAL &&
+               inst->consecutive_al_faults >= ECAT_AL_FAULT_THRESHOLD) {
+        atomic_store(&inst->recovery_al_trigger,
+                     0x10000u | atomic_load_explicit(&inst->al_status, memory_order_relaxed));
+        atomic_store(&inst->bus_state, ECAT_STATE_RECOVERING);
+    }
+#else
+    (void)consec;
+#endif
     return true;
 }
 
@@ -1007,7 +991,6 @@ static void *ecat_bus_thread(void *arg)
         prev_wake_ns   = actual_wake_ns;
         have_prev_wake = true;
 
-        /* Bus exchange + diag updates happen inside ecat_run_one_cycle. */
         ecat_run_one_cycle(inst);
 
         next_wakeup.tv_nsec += (long)(interval_ns % 1000000000LL);
@@ -1016,6 +999,11 @@ static void *ecat_bus_thread(void *arg)
             next_wakeup.tv_nsec -= 1000000000L;
             next_wakeup.tv_sec  += 1;
         }
+
+        struct timespec done;
+        clock_gettime(CLOCK_MONOTONIC, &done);
+        if (ts_to_ns(&done) > ts_to_ns(&next_wakeup))
+            atomic_fetch_add_explicit(&inst->overruns, 1, memory_order_relaxed);
         int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_wakeup, NULL);
         if (rc == EINTR) continue; /* SIGUSR1 wake — loop will re-check bus_running */
     }
@@ -1063,9 +1051,6 @@ static void free_masters(void)
         ecat_master_instance_t *inst = &g_masters[i];
         ecat_data_destroy(inst);
         pthread_mutex_destroy(&inst->slaves_mutex);
-#if ECAT_ENABLE_MONITOR_THREAD
-        pthread_mutex_destroy(&inst->soem_lock);
-#endif
     }
     free(g_masters);
     g_masters = NULL;
@@ -1076,17 +1061,8 @@ static int init_instance_locks(ecat_master_instance_t *inst)
 {
     if (ecat_mutex_init_pi(&inst->slaves_mutex) != 0)
         return -1;
-#if ECAT_ENABLE_MONITOR_THREAD
-    if (ecat_mutex_init_pi(&inst->soem_lock) != 0) {
-        pthread_mutex_destroy(&inst->slaves_mutex);
-        return -1;
-    }
-#endif
     if (ecat_data_init(inst) != 0) {
         pthread_mutex_destroy(&inst->slaves_mutex);
-#if ECAT_ENABLE_MONITOR_THREAD
-        pthread_mutex_destroy(&inst->soem_lock);
-#endif
         return -1;
     }
     return 0;
@@ -1126,9 +1102,6 @@ int ecat_bus_configure(const char *path, char *err, size_t err_size)
             for (int j = 0; j < i; j++) {
                 ecat_data_destroy(&temp[j]);
                 pthread_mutex_destroy(&temp[j].slaves_mutex);
-#if ECAT_ENABLE_MONITOR_THREAD
-                pthread_mutex_destroy(&temp[j].soem_lock);
-#endif
             }
             free(temp);
             snprintf(err, err_size, "failed to initialize master locks");
@@ -1608,11 +1581,7 @@ static cJSON *build_master_status_json(ecat_master_instance_t *inst)
         (ecat_bus_state_t)atomic_load(&inst->bus_state);
     int consecutive_wkc = atomic_load(&inst->consecutive_wkc_errors);
     int recovery_attempts = atomic_load(&inst->recovery_attempts);
-#if ECAT_ENABLE_MONITOR_THREAD
-    uint64_t exchange_skips = atomic_load(&inst->exchange_skips);
-#else
-    uint64_t exchange_skips = 0;
-#endif
+    uint64_t overruns = atomic_load(&inst->overruns);
 
     ecat_diag_view_t diag;
     load_diag_view(inst, &diag);
@@ -1644,7 +1613,7 @@ static cJSON *build_master_status_json(ecat_master_instance_t *inst)
     cJSON_AddNumberToObject(metrics, "min_latency_us", (double)diag.min_latency_us);
     cJSON_AddNumberToObject(metrics, "consecutive_wkc_errors", consecutive_wkc);
     cJSON_AddNumberToObject(metrics, "recovery_attempts", recovery_attempts);
-    cJSON_AddNumberToObject(metrics, "exchange_skips", (double)exchange_skips);
+    cJSON_AddNumberToObject(metrics, "overruns", (double)overruns);
     cJSON_AddItemToObject(master, "metrics", metrics);
 
     return master;
@@ -1681,11 +1650,7 @@ static cJSON *build_master_diagnostics_json(ecat_master_instance_t *inst)
         (ecat_bus_state_t)atomic_load(&inst->bus_state);
     int consecutive_wkc = atomic_load(&inst->consecutive_wkc_errors);
     int recovery_attempts = atomic_load(&inst->recovery_attempts);
-#if ECAT_ENABLE_MONITOR_THREAD
-    uint64_t exchange_skips = atomic_load(&inst->exchange_skips);
-#else
-    uint64_t exchange_skips = 0;
-#endif
+    uint64_t overruns = atomic_load(&inst->overruns);
 
     ecat_diag_view_t diag;
     load_diag_view(inst, &diag);
@@ -1718,6 +1683,7 @@ static cJSON *build_master_diagnostics_json(ecat_master_instance_t *inst)
     cJSON_AddNumberToObject(timing, "configured_cycle_us",
                             inst->config.master.cycle_time_us);
     cJSON_AddNumberToObject(timing, "receive_timeout_us", inst->receive_timeout_us);
+    cJSON_AddNumberToObject(timing, "overruns", (double)overruns);
     cJSON_AddItemToObject(master, "timing", timing);
 
     /* Recovery info */
@@ -1726,10 +1692,19 @@ static cJSON *build_master_diagnostics_json(ecat_master_instance_t *inst)
     cJSON_AddNumberToObject(recovery, "recovery_attempts", recovery_attempts);
     cJSON_AddNumberToObject(recovery, "max_recovery_attempts", ECAT_MAX_RECOVERY_ATTEMPTS);
     cJSON_AddNumberToObject(recovery, "wkc_error_threshold", ECAT_WKC_ERROR_THRESHOLD);
-    cJSON_AddNumberToObject(recovery, "exchange_skips", (double)exchange_skips);
     cJSON_AddNumberToObject(recovery, "writestate_failures",
         (double)atomic_load(&inst->recovery_writestate_failures));
     cJSON_AddItemToObject(master, "recovery", recovery);
+
+    cJSON *al = cJSON_CreateObject();
+    char al_hex[8];
+    snprintf(al_hex, sizeof(al_hex), "0x%04X", (unsigned)atomic_load(&inst->al_status));
+    cJSON_AddStringToObject(al, "status", al_hex);
+    cJSON_AddNumberToObject(al, "responding", atomic_load(&inst->al_wkc));
+    cJSON_AddNumberToObject(al, "replies", (double)atomic_load(&inst->al_replies));
+    cJSON_AddNumberToObject(al, "misses", (double)atomic_load(&inst->al_misses));
+    cJSON_AddNumberToObject(al, "faults", (double)atomic_load(&inst->al_faults));
+    cJSON_AddItemToObject(master, "al_poll", al);
 
     /* Data session */
     cJSON *data = cJSON_CreateObject();

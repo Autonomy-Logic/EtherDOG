@@ -8,7 +8,7 @@ Built on [SOEM](https://github.com/OpenEtherCATsociety/SOEM).
 
 - Several masters, each on its own interface, with a dedicated SCHED_FIFO bus thread and absolute-deadline timing.
 - Topology validation, SDO configuration, PDO mapping, optional distributed clocks and per-slave watchdogs.
-- Background monitoring with automatic slave recovery.
+- Slave AL states read in every bus cycle, and background monitoring with automatic slave recovery. The bus thread never waits for the monitor.
 - Bus scan and slave test for discovery.
 - A published process-data layout per master: every PDO entry with its bit offset.
 - A per-cycle data exchange over AF_UNIX or loopback UDP, with session ids, sequence checks and an output watchdog (outputs go to zero when the client goes quiet).

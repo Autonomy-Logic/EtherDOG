@@ -1044,6 +1044,61 @@ void ecat_master_read_states(ecat_master_instance_t *inst)
         ecx_readstate(&inst->ecx_context);
 }
 
+void ecat_master_mark_all_operational(ecat_master_instance_t *inst)
+{
+    ecx_contextt *ctx = &inst->ecx_context;
+    ctx->slavelist[0].state = EC_STATE_OPERATIONAL;
+    ctx->slavelist[0].ALstatuscode = 0;
+    for (int i = 1; i <= ctx->slavecount; i++) {
+        ctx->slavelist[i].state = EC_STATE_OPERATIONAL;
+        ctx->slavelist[i].ALstatuscode = 0;
+    }
+}
+
+/* SOEM's rx lock: guards rxbufstat[] and rxbuf[] against the thread reading the socket */
+#ifdef WIN32
+#define ECAT_RX_LOCK(port)   EnterCriticalSection(&(port)->rx_mutex)
+#define ECAT_RX_UNLOCK(port) LeaveCriticalSection(&(port)->rx_mutex)
+#else
+#define ECAT_RX_LOCK(port)   pthread_mutex_lock(&(port)->rx_mutex)
+#define ECAT_RX_UNLOCK(port) pthread_mutex_unlock(&(port)->rx_mutex)
+#endif
+
+int ecat_master_al_poll_send(ecat_master_instance_t *inst)
+{
+    ecx_portt *port = &inst->ecx_context.port;
+    uint16 zero = 0;
+    uint8 idx = ecx_getindex(port);
+    ecx_setupdatagram(port, &(port->txbuf[idx]), EC_CMD_BRD, idx, 0, ECT_REG_ALSTAT, sizeof(zero),
+                      &zero);
+    if (ecx_outframe_red(port, idx) <= 0) {
+        ecx_setbufstat(port, idx, EC_BUF_EMPTY);
+        return -1;
+    }
+    return idx;
+}
+
+bool ecat_master_al_poll_collect(ecat_master_instance_t *inst, int idx, uint16_t *al_status,
+                                 int *wkc)
+{
+    ecx_portt *port = &inst->ecx_context.port;
+    bool got = false;
+
+    ECAT_RX_LOCK(port);
+    if (port->rxbufstat[idx] == EC_BUF_RCVD) {
+        uint16 le_status, le_wkc;
+        memcpy(&le_status, &port->rxbuf[idx][EC_HEADERSIZE], sizeof(le_status));
+        memcpy(&le_wkc, &port->rxbuf[idx][EC_HEADERSIZE + sizeof(le_status)], sizeof(le_wkc));
+        *al_status = etohs(le_status);
+        *wkc = etohs(le_wkc);
+        got = true;
+    }
+    ECAT_RX_UNLOCK(port);
+
+    ecx_setbufstat(port, (uint8)idx, EC_BUF_EMPTY);
+    return got;
+}
+
 /*
  * =============================================================================
  * IOmap Access
