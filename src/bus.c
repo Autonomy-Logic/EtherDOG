@@ -431,10 +431,17 @@ static void *ecat_monitor_thread(void *arg)
         int curr_state = atomic_load(&inst->bus_state);
         if (curr_state != last_logged_state) {
             if (curr_state == ECAT_STATE_RECOVERING) {
-                edog_log_warn(&g_logger,
-                    "Master '%s': WKC error threshold (%d) reached, "
-                    "[state: RECOVERING]",
-                    inst->name, ECAT_WKC_ERROR_THRESHOLD);
+                uint32_t al_trigger = atomic_load(&inst->recovery_al_trigger);
+                if (al_trigger == 0)
+                    edog_log_warn(&g_logger,
+                        "Master '%s': WKC error threshold (%d) reached, "
+                        "[state: RECOVERING]",
+                        inst->name, ECAT_WKC_ERROR_THRESHOLD);
+                else
+                    edog_log_warn(&g_logger,
+                        "Master '%s': AL status 0x%04X: not all slaves in OP, "
+                        "[state: RECOVERING]",
+                        inst->name, (unsigned)(al_trigger & 0xFFFF));
             }
             last_logged_state = curr_state;
         }
@@ -596,6 +603,7 @@ static int start_single_master(ecat_master_instance_t *inst)
     atomic_store(&inst->al_replies, 0);
     atomic_store(&inst->al_misses, 0);
     atomic_store(&inst->al_faults, 0);
+    atomic_store(&inst->recovery_al_trigger, 0);
 
     atomic_store(&inst->bus_state, ECAT_STATE_OPERATIONAL);
 
@@ -843,9 +851,15 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
         atomic_store(&inst->consecutive_wkc_errors, 0);
     }
 #if ECAT_ENABLE_MONITOR_THREAD
-    if (state == ECAT_STATE_OPERATIONAL && (consec >= ECAT_WKC_ERROR_THRESHOLD ||
-                                            inst->consecutive_al_faults >= ECAT_AL_FAULT_THRESHOLD))
+    if (state == ECAT_STATE_OPERATIONAL && consec >= ECAT_WKC_ERROR_THRESHOLD) {
+        atomic_store(&inst->recovery_al_trigger, 0);
         atomic_store(&inst->bus_state, ECAT_STATE_RECOVERING);
+    } else if (state == ECAT_STATE_OPERATIONAL &&
+               inst->consecutive_al_faults >= ECAT_AL_FAULT_THRESHOLD) {
+        atomic_store(&inst->recovery_al_trigger,
+                     0x10000u | atomic_load_explicit(&inst->al_status, memory_order_relaxed));
+        atomic_store(&inst->bus_state, ECAT_STATE_RECOVERING);
+    }
 #else
     (void)consec;
 #endif

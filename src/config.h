@@ -553,6 +553,7 @@ typedef struct {
     _Atomic(uint64_t)  al_replies;
     _Atomic(uint64_t)  al_misses;
     _Atomic(uint64_t)  al_faults;                  /* replies not all-OP or short       */
+    _Atomic(uint32_t)  recovery_al_trigger;        /* 0: WKC; else 0x10000 | AL status  */
 
     /* Snapshot for status queries; the monitor owns slavelist[] and publishes here. */
     ecat_slave_status_t slaves_snapshot[ECAT_MAX_SLAVES];
