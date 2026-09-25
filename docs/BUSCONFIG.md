@@ -98,9 +98,10 @@ A configuration that exceeds any of these is refused as a whole; nothing is trun
 | Entries per PDO | 32 |
 | Channels per slave | 64 |
 | SDO configurations per slave | 32 |
-| Names | 63 characters |
 | Process data entries in a master's layout (both directions) | 8192 |
 | Process image per direction | 4096 bytes |
+
+Names (masters, slaves, PDOs, entries) longer than 63 characters are shortened to 63.
 
 ## Example
 
