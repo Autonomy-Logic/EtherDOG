@@ -447,8 +447,8 @@ typedef struct {
  * =============================================================================
  */
 
-/* Maximum PDO entries published in one direction of a master's layout */
-#define ECAT_MAX_LAYOUT_ENTRIES 512
+/* Maximum PDO entries in a master's layout, both directions, mapped or not (about 112 bytes each) */
+#define ECAT_MAX_LAYOUT_ENTRIES 8192
 
 /**
  * @brief One PDO entry as it sits in the published process image.
