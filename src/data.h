@@ -6,8 +6,8 @@
  * @brief Cyclic data session: one datagram of inputs out and one of outputs in per bus cycle.
  *
  * The control thread opens and closes the session; the bus thread calls apply_outputs before
- * each exchange and publish_inputs after it, both while holding soem_lock. Neither blocks: the
- * socket is non-blocking and the session lock is only trylocked on the bus thread.
+ * each exchange and publish_inputs after it. Neither blocks: the socket is non-blocking and the
+ * session lock is only trylocked on the bus thread.
  */
 
 #ifndef EDOG_DATA_H

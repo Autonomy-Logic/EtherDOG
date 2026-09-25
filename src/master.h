@@ -179,6 +179,55 @@ int ecat_master_recover_slave(ecat_master_instance_t *inst, int position, edog_l
 void ecat_master_read_states(ecat_master_instance_t *inst);
 
 /**
+ * @brief Set every slave's cached state to OP with no AL status code
+ *
+ * What ecx_readstate() stores when all slaves report OP; used when the cyclic AL poll already
+ * shows that, so the monitor puts no frame on the wire. Monitor thread only.
+ *
+ * @param inst Per-master instance
+ */
+void ecat_master_mark_all_operational(ecat_master_instance_t *inst);
+
+/**
+ * @brief Send a BRD of the AL status register without waiting for the reply
+ *
+ * The reply is stored by whichever thread reads the socket next and is picked up with
+ * ecat_master_al_poll_collect().
+ *
+ * @param inst Per-master instance
+ * @return Frame index to collect, or -1 if the frame was not sent
+ */
+int ecat_master_al_poll_send(ecat_master_instance_t *inst);
+
+/**
+ * @brief Collect a reply sent by ecat_master_al_poll_send() and release its frame index
+ *
+ * Never waits.
+ *
+ * @param inst      Per-master instance
+ * @param idx       Index returned by ecat_master_al_poll_send()
+ * @param al_status OR of every slave's AL status register
+ * @param wkc       Number of slaves that answered
+ * @return true if the reply had arrived
+ */
+bool ecat_master_al_poll_collect(ecat_master_instance_t *inst, int idx, uint16_t *al_status,
+                                 int *wkc);
+
+/**
+ * @brief Whether an AL status poll reply shows every slave in OP without error
+ *
+ * @param al_status   OR of every slave's AL status register
+ * @param wkc         Number of slaves that answered
+ * @param slave_count Slaves on the bus
+ * @return true if all slaves answered and all are in OP
+ */
+static inline bool ecat_al_poll_healthy(uint16_t al_status, int wkc, int slave_count)
+{
+    return slave_count > 0 && wkc >= slave_count &&
+           (al_status & (0x0F | EC_STATE_ERROR)) == EC_STATE_OPERATIONAL;
+}
+
+/**
  * @brief Get a pointer to the IOmap buffer base
  *
  * @param inst Per-master instance

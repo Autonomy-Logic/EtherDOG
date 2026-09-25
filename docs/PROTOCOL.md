@@ -89,7 +89,7 @@ Any other first request, or a wrong token, gets an error and the connection is c
 | `test` | `interface`, `position` | Reports the slave at one position. Refused while the bus runs. |
 | `list-interfaces` | none | Lists the network adapters. |
 | `status` | none | Per master: state, slaves with their AL state, and cycle metrics. |
-| `diagnostics` | none | `status`, plus timing, recovery, data-session counters (`frames_rx`, `frames_tx`, `frames_dropped`, `watchdog_trips`) and a hex snapshot of the process image. |
+| `diagnostics` | none | `status`, plus timing (including `overruns`, cycles that ended past the next deadline), recovery, the cyclic AL status poll (`al_poll`: `status`, `responding`, `replies`, `misses`, `faults`), data-session counters (`frames_rx`, `frames_tx`, `frames_dropped`, `watchdog_trips`) and a hex snapshot of the process image. |
 | `logs` | `min_id`, `level`, `max` | Recent log entries from the in-memory ring, oldest first. The reply includes `next_id`, the value to pass as `min_id` next time. |
 
 ## Data channel
