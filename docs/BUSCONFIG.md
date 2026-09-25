@@ -86,6 +86,22 @@ An SDO:
 
 `log_connections` (`true`), `log_data_access` (`false`), `log_errors` (`true`), `max_log_entries` (`10000`) and `status_update_interval_ms` (`500`) are accepted for compatibility.
 
+## Limits
+
+A configuration that exceeds any of these is refused as a whole; nothing is truncated.
+
+| Item | Limit |
+|---|---|
+| Masters | 4 |
+| Slaves per master | 64 |
+| PDOs per slave, per direction | 16 |
+| Entries per PDO | 32 |
+| Channels per slave | 64 |
+| SDO configurations per slave | 32 |
+| Names | 63 characters |
+| Process data entries in a master's layout (both directions) | 8192 |
+| Process image per direction | 4096 bytes |
+
 ## Example
 
 [examples/ek1818_busconfig.json](../examples/ek1818_busconfig.json) is a Beckhoff EK1818: 8 digital inputs and 4 digital outputs.

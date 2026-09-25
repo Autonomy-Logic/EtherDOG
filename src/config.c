@@ -363,7 +363,9 @@ static int parse_pdo(const cJSON *pdo_json, ecat_pdo_t *pdo)
         const cJSON *entry_json;
         cJSON_ArrayForEach(entry_json, entries) {
             if (pdo->entry_count >= ECAT_MAX_PDO_ENTRIES) {
-                break;
+                edog_log_error(g_config_logger, "PDO %s has more than %d entries", pdo->index,
+                               ECAT_MAX_PDO_ENTRIES);
+                return ECAT_CONFIG_ERR_INVALID;
             }
             if (parse_pdo_entry(entry_json, &pdo->entries[pdo->entry_count]) == ECAT_CONFIG_OK) {
                 pdo->entry_count++;
@@ -385,14 +387,17 @@ static int parse_pdo_array(const cJSON *pdo_array, ecat_pdo_t *pdos, int *pdo_co
         return ECAT_CONFIG_OK;
     }
 
+    /* Truncating would program a PDO assignment that is not the configured one, so refuse */
     const cJSON *pdo_json;
     cJSON_ArrayForEach(pdo_json, pdo_array) {
         if (*pdo_count >= ECAT_MAX_PDOS) {
-            break;
+            edog_log_error(g_config_logger, "more than %d PDOs in one direction", ECAT_MAX_PDOS);
+            return ECAT_CONFIG_ERR_INVALID;
         }
-        if (parse_pdo(pdo_json, &pdos[*pdo_count]) == ECAT_CONFIG_OK) {
-            (*pdo_count)++;
-        }
+        int rc = parse_pdo(pdo_json, &pdos[*pdo_count]);
+        if (rc != ECAT_CONFIG_OK)
+            return rc;
+        (*pdo_count)++;
     }
 
     return ECAT_CONFIG_OK;
@@ -543,7 +548,9 @@ static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
         const cJSON *ch_json;
         cJSON_ArrayForEach(ch_json, channels) {
             if (slave->channel_count >= ECAT_MAX_CHANNELS) {
-                break;
+                edog_log_error(g_config_logger, "Slave '%s' position %d: more than %d channels",
+                               slave->name, slave->position, ECAT_MAX_CHANNELS);
+                return ECAT_CONFIG_ERR_INVALID;
             }
             if (parse_channel(ch_json, &slave->channels[slave->channel_count]) == ECAT_CONFIG_OK) {
                 slave->channel_count++;
@@ -577,10 +584,14 @@ static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
     }
 
     /* Parse RxPDOs and TxPDOs */
-    parse_pdo_array(cJSON_GetObjectItemCaseSensitive(slave_json, "rx_pdos"),
-                    slave->rx_pdos, &slave->rx_pdo_count);
-    parse_pdo_array(cJSON_GetObjectItemCaseSensitive(slave_json, "tx_pdos"),
-                    slave->tx_pdos, &slave->tx_pdo_count);
+    if (parse_pdo_array(cJSON_GetObjectItemCaseSensitive(slave_json, "rx_pdos"), slave->rx_pdos,
+                        &slave->rx_pdo_count) != ECAT_CONFIG_OK ||
+        parse_pdo_array(cJSON_GetObjectItemCaseSensitive(slave_json, "tx_pdos"), slave->tx_pdos,
+                        &slave->tx_pdo_count) != ECAT_CONFIG_OK) {
+        edog_log_error(g_config_logger, "Slave '%s' position %d: invalid PDO configuration",
+                       slave->name, slave->position);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
 
     /* Parse per-slave configuration (defaults applied if "config" is absent) */
     slave->startup_checks.check_vendor_id = true;
@@ -675,10 +686,8 @@ static int parse_slaves_section(const cJSON *slaves, ecat_config_t *config)
     const cJSON *slave_json;
     cJSON_ArrayForEach(slave_json, slaves) {
         if (config->slave_count >= ECAT_MAX_SLAVES) {
-            edog_log_error(g_config_logger,
-                "slaves array exceeds ECAT_MAX_SLAVES=%d -- "
-                "extra entries ignored", ECAT_MAX_SLAVES);
-            break;
+            edog_log_error(g_config_logger, "more than %d slaves on one master", ECAT_MAX_SLAVES);
+            return ECAT_CONFIG_ERR_INVALID;
         }
         int prc = parse_slave(slave_json, &config->slaves[config->slave_count]);
         if (prc != ECAT_CONFIG_OK) {
@@ -855,13 +864,13 @@ int ecat_config_parse_all(const char *config_path,
 
         const char *name = get_string(entry, "name", "master");
 
-        /* Reject extra masters loudly rather than truncating. */
+        /* Refuse extra masters instead of running a subset of the configuration */
         if (count >= max_masters) {
-            edog_log_error(g_config_logger,
-                "skipping entry[%d] '%s' -- max_masters=%d reached. "
-                "Increase ECAT_MAX_MASTERS or remove extra ETHERCAT entries.",
-                i, name, max_masters);
-            continue;
+            edog_log_error(g_config_logger, "entry[%d] '%s': more than %d masters", i, name,
+                           max_masters);
+            cJSON_Delete(root);
+            *out_count = 0;
+            return ECAT_CONFIG_ERR_INVALID;
         }
 
         /* Initialize this instance's config with defaults */

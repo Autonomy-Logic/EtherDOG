@@ -344,3 +344,82 @@ void test_parse_all_BareObjectRoot_ShouldFallBackToSingleEntry(void)
     TEST_ASSERT_EQUAL_INT(1, count);
     TEST_ASSERT_EQUAL_STRING("bare", g_instances[0].name);
 }
+
+/* =====================================================================
+ *  Limits: exceeding one refuses the configuration instead of truncating
+ * ===================================================================== */
+
+static char g_json[1 << 20];
+
+/* One master on eth0 with @slaves slaves, each with @pdos RxPDOs of @entries entries. */
+static void write_bus(int slaves, int pdos, int entries)
+{
+    size_t n = 0;
+    n += snprintf(g_json + n, sizeof(g_json) - n,
+                  "[{\"name\":\"m\",\"protocol\":\"ETHERCAT\",\"config\":{\"master\":"
+                  "{\"interface\":\"eth0\"},\"slaves\":[");
+    for (int s = 0; s < slaves; s++) {
+        n += snprintf(g_json + n, sizeof(g_json) - n, "%s{\"position\":%d,\"name\":\"s%d\",\"vendor_id\":\"0x2\",\"product_code\":\"0x1\",\"rx_pdos\":[",
+                      s ? "," : "", s + 1, s + 1);
+        for (int p = 0; p < pdos; p++) {
+            n += snprintf(g_json + n, sizeof(g_json) - n, "%s{\"index\":\"0x%04X\",\"entries\":[",
+                          p ? "," : "", 0x1600 + p);
+            for (int e = 0; e < entries; e++)
+                n += snprintf(g_json + n, sizeof(g_json) - n,
+                              "%s{\"index\":\"0x7000\",\"subindex\":%d,\"bit_length\":1,"
+                              "\"data_type\":\"BOOL\"}",
+                              e ? "," : "", e + 1);
+            n += snprintf(g_json + n, sizeof(g_json) - n, "]}");
+        }
+        n += snprintf(g_json + n, sizeof(g_json) - n, "]}");
+    }
+    snprintf(g_json + n, sizeof(g_json) - n, "]}}]");
+    write_tmpfile(g_json);
+}
+
+static int parse_tmp(void)
+{
+    int count = 0;
+    return ecat_config_parse_all(TMPFILE, g_instances, ECAT_MAX_MASTERS, &count);
+}
+
+void test_limits_AtEveryLimit_ShouldParse(void)
+{
+    write_bus(ECAT_MAX_SLAVES, 1, 1);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, parse_tmp());
+    write_bus(1, ECAT_MAX_PDOS, ECAT_MAX_PDO_ENTRIES);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, parse_tmp());
+    TEST_ASSERT_EQUAL_INT(ECAT_MAX_PDOS, g_instances[0].config.slaves[0].rx_pdo_count);
+    TEST_ASSERT_EQUAL_INT(ECAT_MAX_PDO_ENTRIES, g_instances[0].config.slaves[0].rx_pdos[0].entry_count);
+}
+
+void test_limits_TooManyPdoEntries_ShouldReject(void)
+{
+    write_bus(1, 1, ECAT_MAX_PDO_ENTRIES + 1);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_ERR_INVALID, parse_tmp());
+}
+
+void test_limits_TooManyPdos_ShouldReject(void)
+{
+    write_bus(1, ECAT_MAX_PDOS + 1, 1);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_ERR_INVALID, parse_tmp());
+}
+
+void test_limits_TooManySlaves_ShouldReject(void)
+{
+    write_bus(ECAT_MAX_SLAVES + 1, 1, 1);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_ERR_INVALID, parse_tmp());
+}
+
+void test_limits_TooManyMasters_ShouldReject(void)
+{
+    size_t n = snprintf(g_json, sizeof(g_json), "[");
+    for (int m = 0; m <= ECAT_MAX_MASTERS; m++)
+        n += snprintf(g_json + n, sizeof(g_json) - n,
+                      "%s{\"name\":\"m%d\",\"protocol\":\"ETHERCAT\",\"config\":{\"master\":"
+                      "{\"interface\":\"eth%d\"},\"slaves\":[]}}",
+                      m ? "," : "", m, m);
+    snprintf(g_json + n, sizeof(g_json) - n, "]");
+    write_tmpfile(g_json);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_ERR_INVALID, parse_tmp());
+}
