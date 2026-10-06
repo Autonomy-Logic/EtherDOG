@@ -277,6 +277,7 @@ static void drain_mailbox_and_errors(ecat_master_instance_t *inst)
     int err_count = 0;
 
     /* At most 8 mailboxes per pass */
+    /* Runs beside the bus thread: keep SOEM's cyclic mailbox mode off, it reads group mbxstatus */
     ecx_mbxhandler(&inst->ecx_context, 0, 8);
     while (err_count < EC_MAXELIST &&
            ecx_poperror(&inst->ecx_context, &errors[err_count])) {
@@ -596,7 +597,6 @@ static int start_single_master(ecat_master_instance_t *inst)
     }
 
     atomic_store(&inst->overruns, 0);
-    inst->al_poll_idx = -1;
     inst->consecutive_al_faults = 0;
     atomic_store(&inst->al_status, 0);
     atomic_store(&inst->al_wkc, 0);
@@ -616,11 +616,14 @@ static int start_single_master(ecat_master_instance_t *inst)
 #if ECAT_ENABLE_MONITOR_THREAD
     atomic_store(&inst->monitor_running, true);
 
-    if (pthread_create(&inst->monitor_thread, NULL, ecat_monitor_thread, inst) != 0) {
-        edog_log_warn(&g_logger,
-            "Master '%s': Failed to create monitor thread - "
-            "running without state monitoring", inst->name);
+    int mrc = pthread_create(&inst->monitor_thread, NULL, ecat_monitor_thread, inst);
+    if (mrc != 0) {
+        /* Without the monitor nothing recovers slaves or leaves RECOVERING */
+        edog_log_error(&g_logger, "Master '%s': Failed to create monitor thread: %s",
+                       inst->name, strerror(mrc));
         atomic_store(&inst->monitor_running, false);
+        atomic_store(&inst->bus_state, ECAT_STATE_ERROR);
+        return -1;
     }
 #endif
 
@@ -738,16 +741,36 @@ static void stop_single_master(ecat_master_instance_t *inst)
         "Master '%s': [state: STOPPED] EtherCAT master stopped", inst->name);
 }
 
+/* Records this cycle's AL status poll; a frame that was not sent or not answered is a miss. */
+static void collect_al_poll(ecat_master_instance_t *inst, int al_idx)
+{
+    uint16_t al_status = 0;
+    int al_wkc = 0;
+    if (al_idx < 0 || !ecat_master_al_poll_collect(inst, al_idx, &al_status, &al_wkc)) {
+        atomic_fetch_add_explicit(&inst->al_misses, 1, memory_order_relaxed);
+        return;
+    }
+    atomic_store_explicit(&inst->al_status, al_status, memory_order_relaxed);
+    atomic_store_explicit(&inst->al_wkc, al_wkc, memory_order_relaxed);
+    if (ecat_al_poll_healthy(al_status, al_wkc, inst->ecx_context.slavecount)) {
+        inst->consecutive_al_faults = 0;
+    } else {
+        inst->consecutive_al_faults++;
+        atomic_fetch_add_explicit(&inst->al_faults, 1, memory_order_relaxed);
+    }
+    /* Counted after faults: the monitor reads replies first */
+    atomic_fetch_add_explicit(&inst->al_replies, 1, memory_order_release);
+}
+
 /**
  * @brief Perform one EtherCAT cycle for a single master instance
  *
  * Called by the dedicated bus thread on every cycle:
  *
  *   1. apply the newest output frame from the client (or the safe state) into the IOmap
- *   2. SOEM exchange
+ *   2. AL status poll, then the SOEM exchange; the poll's reply is collected right after
  *   3. send the input region to the client
- *   4. collect the previous AL status poll, send the next one
- *   5. update WKC + diagnostics
+ *   4. update WKC + diagnostics
  *
  * Only this thread touches the IOmap. It never waits on the monitor: SOEM locks the socket per
  * frame, with priority inheritance on Linux.
@@ -772,37 +795,21 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
     /* 1. Newest outputs from the client, or the safe state if it went quiet. */
     ecat_data_apply_outputs(inst, master_index);
 
-    /* 2. Exchange process data with slaves. */
+    /* 2. AL status poll ahead of the process data: the wire keeps frame order, so the
+     * process-data receive stores its reply and no frame index outlives the cycle. */
+    int al_idx = ecat_master_al_poll_send(inst);
+
     osal_get_monotonic_time(&t_exch_start);
     int wkc = ecat_master_exchange_processdata(inst, inst->receive_timeout_us);
     osal_get_monotonic_time(&t_exch_end);
+
+    collect_al_poll(inst, al_idx);
 
     uint64_t exchange_ns = elapsed_ns(&t_exch_start, &t_exch_end);
 
     /* 3. Inputs to the client, flagged with bus health for this cycle. */
     ecat_data_publish_inputs(inst, master_index, wkc, state == ECAT_STATE_OPERATIONAL,
                              wkc >= inst->expected_wkc);
-
-    /* 4. AL status: the previous reply came in with this cycle's frames */
-    if (inst->al_poll_idx >= 0) {
-        uint16_t al_status = 0;
-        int al_wkc = 0;
-        if (ecat_master_al_poll_collect(inst, inst->al_poll_idx, &al_status, &al_wkc)) {
-            atomic_store_explicit(&inst->al_status, al_status, memory_order_relaxed);
-            atomic_store_explicit(&inst->al_wkc, al_wkc, memory_order_relaxed);
-            if (ecat_al_poll_healthy(al_status, al_wkc, inst->ecx_context.slavecount)) {
-                inst->consecutive_al_faults = 0;
-            } else {
-                inst->consecutive_al_faults++;
-                atomic_fetch_add_explicit(&inst->al_faults, 1, memory_order_relaxed);
-            }
-            /* Counted after faults: the monitor reads replies first */
-            atomic_fetch_add_explicit(&inst->al_replies, 1, memory_order_release);
-        } else {
-            atomic_fetch_add_explicit(&inst->al_misses, 1, memory_order_relaxed);
-        }
-    }
-    inst->al_poll_idx = ecat_master_al_poll_send(inst);
 
     inst->cycle_counter++;
 

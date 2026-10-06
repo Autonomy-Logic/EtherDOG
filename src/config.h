@@ -546,7 +546,6 @@ typedef struct {
     _Atomic(uint64_t) overruns;
 
     /* AL status poll: one BRD per cycle, collected the next cycle. Bus thread only writes. */
-    int                al_poll_idx;                /* pending frame index, -1 when none */
     int                consecutive_al_faults;
     _Atomic(uint16_t)  al_status;                  /* OR of every slave's AL status     */
     _Atomic(int)       al_wkc;                     /* slaves that answered              */

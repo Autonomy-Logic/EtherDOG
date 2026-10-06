@@ -1055,14 +1055,8 @@ void ecat_master_mark_all_operational(ecat_master_instance_t *inst)
     }
 }
 
-/* SOEM's rx lock: guards rxbufstat[] and rxbuf[] against the thread reading the socket */
-#ifdef WIN32
-#define ECAT_RX_LOCK(port)   EnterCriticalSection(&(port)->rx_mutex)
-#define ECAT_RX_UNLOCK(port) LeaveCriticalSection(&(port)->rx_mutex)
-#else
-#define ECAT_RX_LOCK(port)   pthread_mutex_lock(&(port)->rx_mutex)
-#define ECAT_RX_UNLOCK(port) pthread_mutex_unlock(&(port)->rx_mutex)
-#endif
+/* Defined by SOEM's Linux and Win32 nicdrv.c but not declared in their headers */
+int ecx_inframe(ecx_portt *port, uint8 idx, int stacknumber);
 
 int ecat_master_al_poll_send(ecat_master_instance_t *inst)
 {
@@ -1082,19 +1076,15 @@ bool ecat_master_al_poll_collect(ecat_master_instance_t *inst, int idx, uint16_t
                                  int *wkc)
 {
     ecx_portt *port = &inst->ecx_context.port;
-    bool got = false;
-
-    ECAT_RX_LOCK(port);
-    if (port->rxbufstat[idx] == EC_BUF_RCVD) {
-        uint16 le_status, le_wkc;
+    /* Non-blocking: the reply stored by the process-data receive, or at most one packet read now */
+    int rc = ecx_inframe(port, (uint8)idx, 0);
+    bool got = rc >= 0;
+    if (got) {
+        uint16 le_status;
         memcpy(&le_status, &port->rxbuf[idx][EC_HEADERSIZE], sizeof(le_status));
-        memcpy(&le_wkc, &port->rxbuf[idx][EC_HEADERSIZE + sizeof(le_status)], sizeof(le_wkc));
         *al_status = etohs(le_status);
-        *wkc = etohs(le_wkc);
-        got = true;
+        *wkc = rc;
     }
-    ECAT_RX_UNLOCK(port);
-
     ecx_setbufstat(port, (uint8)idx, EC_BUF_EMPTY);
     return got;
 }

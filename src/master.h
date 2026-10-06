@@ -191,8 +191,8 @@ void ecat_master_mark_all_operational(ecat_master_instance_t *inst);
 /**
  * @brief Send a BRD of the AL status register without waiting for the reply
  *
- * The reply is stored by whichever thread reads the socket next and is picked up with
- * ecat_master_al_poll_collect().
+ * Sent just before the process data, so the process-data receive stores its reply; collect it
+ * with ecat_master_al_poll_collect() in the same cycle.
  *
  * @param inst Per-master instance
  * @return Frame index to collect, or -1 if the frame was not sent
@@ -202,7 +202,7 @@ int ecat_master_al_poll_send(ecat_master_instance_t *inst);
 /**
  * @brief Collect a reply sent by ecat_master_al_poll_send() and release its frame index
  *
- * Never waits.
+ * Never waits. The index is released whether or not the reply arrived.
  *
  * @param inst      Per-master instance
  * @param idx       Index returned by ecat_master_al_poll_send()

@@ -88,9 +88,28 @@ Any other first request, or a wrong token, gets an error and the connection is c
 | `scan` | `interface` | Lists the slaves found on an interface. Refused while the bus runs. |
 | `test` | `interface`, `position` | Reports the slave at one position. Refused while the bus runs. |
 | `list-interfaces` | none | Lists the network adapters. |
-| `status` | none | Per master: state, slaves with their AL state, and cycle metrics. |
+| `status` | none | Per master: state, slaves with their AL state, and cycle metrics (see below). |
 | `diagnostics` | none | `status`, plus timing (including `overruns`, cycles that ended past the next deadline), recovery, the cyclic AL status poll (`al_poll`: `status`, `responding`, `replies`, `misses`, `faults`), data-session counters (`frames_rx`, `frames_tx`, `frames_dropped`, `watchdog_trips`) and a hex snapshot of the process image. |
 | `logs` | `min_id`, `level`, `max` | Recent log entries from the in-memory ring, oldest first. The reply includes `next_id`, the value to pass as `min_id` next time. |
+
+### Cycle metrics
+
+`status` returns these keys in each master's `metrics` object; `diagnostics` returns the timing ones in `timing`.
+
+| Key | Meaning |
+|---|---|
+| `cycle_count` | Bus cycles run since the master started. |
+| `wkc_error_count` | Cycles whose working counter was below the expected value. |
+| `noframe_count` | Cycles whose process-data frame did not come back. |
+| `avg_cycle_us`, `min_cycle_us`, `max_cycle_us` | Time of the process-data exchange (send and receive). |
+| `min_exchange_us`, `max_exchange_us` | Same values as `min_cycle_us` and `max_cycle_us`. |
+| `avg_period_us`, `min_period_us`, `max_period_us` | Time between the starts of consecutive cycles. |
+| `avg_latency_us`, `min_latency_us`, `max_latency_us` | How late each cycle woke after its deadline. |
+| `consecutive_wkc_errors` | Working-counter errors in a row; `ECAT_WKC_ERROR_THRESHOLD` (3) in OPERATIONAL starts recovery. |
+| `recovery_attempts` | Attempts in the current recovery; back to 0 once every slave is OPERATIONAL again. |
+| `overruns` | Cycles that ended past the next deadline. The bus never skips a cycle; an overrun only delays the next one. |
+
+`exchange_skips` is no longer reported: the bus cycle no longer waits on the monitor, so it cannot be skipped.
 
 ## Data channel
 
