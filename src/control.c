@@ -178,9 +178,18 @@ static void drop_client(client_t *c)
 
 static void hello_response(client_t *c)
 {
-    char text[160];
+    /* R4 (RTOP-319): advertise the EtherCAT feature set so a newer editor can refuse to
+     * compile a project that targets this EtherDOG with features it does not support.
+     * The feature names are stable identifiers; add new ones at the end of the list. */
+    char text[320];
     snprintf(text, sizeof(text),
-             "{\"status\":\"success\",\"name\":\"EtherDOG\",\"version\":\"%s\",\"protocol\":%d}",
+             "{\"status\":\"success\",\"name\":\"EtherDOG\",\"version\":\"%s\",\"protocol\":%d,"
+             "\"features\":["
+             "\"ethercat.dynamic_alloc\","
+             "\"ethercat.sdo_byte_string\","
+             "\"ethercat.sdo_complete_access\","
+             "\"ethercat.scan_modules\""
+             "]}",
              EDOG_VERSION, EDOG_PROTOCOL_VERSION);
     reply(c, text);
 }

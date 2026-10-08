@@ -70,6 +70,22 @@ An SDO:
 { "index": "0x8000", "subindex": 1, "value": 3, "data_type": "UINT16", "name": "Filter" }
 ```
 
+Two optional additions, added in RTOP-319 R2:
+
+- `value_bytes` carries a raw byte-string payload instead of a numeric `value`. It accepts
+  a plain string, taken as its UTF-8 bytes (no trailing NUL), or a `"0x..."` hex form
+  decoded to bytes. When present, `value` and the `data_type` range check are not
+  consulted; the payload wire-type is the bytes themselves. Needed for ETG.5001 module
+  `InitCmd` writes like `0x80n0:03 = "UR20-4DI-P"` that no numeric type can represent.
+- `complete_access`: `true` sends the SDO with CoE Complete Access (one PDU updates every
+  sub-index of the object). Required for `0xF030` on couplers that advertise
+  CompleteAccess. Defaults to `false`.
+
+```json
+{ "index": "0x8010", "subindex": 3, "value_bytes": "UR20-4DI-P",
+  "data_type": "UINT8", "name": "Module name init" }
+```
+
 ### slaves[].config
 
 | Field | Default |
@@ -88,20 +104,40 @@ An SDO:
 
 ## Limits
 
-A configuration that exceeds any of these is refused as a whole; nothing is truncated.
+Per-master and per-slave buffers are heap-allocated at config load (RTOP-319 R1), so the
+only remaining limits are the ones the EtherCAT protocol or EtherDOG's own addressing
+model enforces. A configuration that cannot be allocated is refused as a whole; nothing
+is truncated.
 
-| Item | Limit |
-|---|---|
-| Masters | 4 |
-| Slaves per master | 64 |
-| PDOs per slave, per direction | 16 |
-| Entries per PDO | 32 |
-| Channels per slave | 64 |
-| SDO configurations per slave | 32 |
-| Process data entries in a master's layout (both directions) | 8192 |
-| Process image per direction | 4096 bytes |
+| Item | Limit | Reason |
+|---|---|---|
+| Masters | 4 | Top-level cap; one bus per NIC in practice. |
+| Slaves per master | hardware memory | Allocated per project at upload. |
+| PDOs per slave, per direction | hardware memory | Allocated per project at upload. |
+| Entries per PDO | hardware memory | Allocated per project at upload. |
+| Channels per slave | hardware memory | Allocated per project at upload. |
+| SDO configurations per slave | hardware memory | Allocated per project at upload. |
+| Process image per direction | 4096 bytes | EtherCAT frame payload at MTU. |
+
+The iomap is initially allocated at `ECAT_IOMAP_INITIAL_SIZE` = 64 KiB, enough for a
+fully populated UR20 station (64 modules) with alignment slack. A configuration that
+needs more is refused at `ecx_config_map_group`; raising the constant is a one-line
+tune in `src/config.h`.
 
 Names (masters, slaves, PDOs, entries) longer than 63 characters are shortened to 63.
+
+## Protocol capabilities
+
+The `hello` control-socket response advertises the EtherCAT feature set so a newer
+editor can refuse to compile a project that targets this EtherDOG with features it does
+not support. Current features:
+
+| Name | Meaning |
+|---|---|
+| `ethercat.dynamic_alloc` | Per-master and per-slave buffers sized from the project at config load (R1). |
+| `ethercat.sdo_byte_string` | `sdo_configurations[].value_bytes` is honoured (R2). |
+| `ethercat.sdo_complete_access` | `sdo_configurations[].complete_access` is honoured (R2). |
+| `ethercat.scan_modules` | `scan-modules` control-socket command reads `0xF050` on a slave (R3). |
 
 ## Example
 
