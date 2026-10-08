@@ -733,9 +733,11 @@ static void stop_single_master(ecat_master_instance_t *inst)
 
     /* IP-stack isolation revert happens inside ecat_master_close(). */
 
-    /* The layout dies with the mapping; a client must reopen its session after a restart. */
+    /* The layout dies with the mapping; a client must reopen its session after a restart.
+     * RTOP-319 R1: layout.entries is heap-owned, so free it before zeroing the rest of
+     * the struct (plain memset would leak the entries buffer). */
     ecat_data_close(inst);
-    memset(&inst->layout, 0, sizeof(inst->layout));
+    ecat_layout_destroy(&inst->layout);
     atomic_store(&inst->consecutive_wkc_errors, 0);
     atomic_store(&inst->recovery_attempts, 0);
     atomic_store(&inst->recovery_writestate_failures, 0);
@@ -744,9 +746,14 @@ static void stop_single_master(ecat_master_instance_t *inst)
     ecat_master_close(inst, &g_logger);
     atomic_store(&inst->bus_state, ECAT_STATE_STOPPED);
 
-    /* Bus closed: the old AL states mean nothing */
+    /* Bus closed: the old AL states mean nothing. RTOP-319 R1: slaves_snapshot was freed by
+     * ecat_master_close() above. Keep the count reset for status queries that may run
+     * before the next start reallocates the buffer. */
     pthread_mutex_lock(&inst->slaves_mutex);
-    memset(inst->slaves_snapshot, 0, sizeof(inst->slaves_snapshot));
+    if (inst->slaves_snapshot != NULL && inst->slaves_snapshot_capacity > 0) {
+        memset(inst->slaves_snapshot, 0,
+               (size_t)inst->slaves_snapshot_capacity * sizeof(ecat_slave_status_t));
+    }
     inst->slaves_snapshot_count = 0;
     pthread_mutex_unlock(&inst->slaves_mutex);
 
@@ -1967,6 +1974,69 @@ static int handle_close_data_command(ecat_reply_t *out)
     return 0;
 }
 
+/*
+ * R3 (RTOP-319): "scan-modules" command for ETG.5001 modular couplers.
+ *
+ * Request: {"command":"scan-modules","params":{"master":<index>,"slave":<pos>}}
+ * Response: {"status":"success","idents":[0xN,0xN,...]} or {"status":"error","message":"..."}
+ *
+ * Reads 0xF050 on the given slave via ecat_master_scan_modules() and returns the detected
+ * module idents in slot order. The caller matches each ident against its ESI repository.
+ */
+static int handle_scan_modules_command(cJSON *root, ecat_reply_t *out)
+{
+    cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
+    if (params == NULL || !cJSON_IsObject(params)) {
+        reply_printf(out, "{\"status\":\"error\",\"message\":\"missing 'params'\"}");
+        return -1;
+    }
+    cJSON *mj = cJSON_GetObjectItemCaseSensitive(params, "master");
+    cJSON *sj = cJSON_GetObjectItemCaseSensitive(params, "slave");
+    if (!cJSON_IsNumber(mj) || !cJSON_IsNumber(sj)) {
+        reply_printf(out, "{\"status\":\"error\","
+                          "\"message\":\"'master' and 'slave' must be numbers\"}");
+        return -1;
+    }
+    int master_idx = mj->valueint;
+    int slave_pos = sj->valueint;
+
+    if (master_idx < 0 || master_idx >= g_master_count) {
+        reply_printf(out, "{\"status\":\"error\","
+                          "\"message\":\"master index %d out of range (0..%d)\"}",
+                     master_idx, g_master_count - 1);
+        return -1;
+    }
+
+    /* Bounded buffer: ETG.5001 caps a station at 128 slots and 256 is twice that. */
+    uint32_t idents[256];
+    int ident_count = 0;
+    char err[160];
+    err[0] = '\0';
+    int rc = ecat_master_scan_modules(&g_masters[master_idx], slave_pos, idents,
+                                      (int)(sizeof(idents) / sizeof(idents[0])),
+                                      &ident_count, err, sizeof(err), &g_logger);
+    if (rc != 0) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "status", "error");
+        cJSON_AddStringToObject(resp, "message", err[0] ? err : "scan failed");
+        reply_json(out, resp);
+        return -1;
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "status", "success");
+    cJSON_AddNumberToObject(resp, "master", master_idx);
+    cJSON_AddNumberToObject(resp, "slave", slave_pos);
+    cJSON *arr = cJSON_AddArrayToObject(resp, "idents");
+    for (int i = 0; i < ident_count; i++) {
+        char buf[12];
+        snprintf(buf, sizeof(buf), "0x%08X", (unsigned)idents[i]);
+        cJSON_AddItemToArray(arr, cJSON_CreateString(buf));
+    }
+    reply_json(out, resp);
+    return 0;
+}
+
 static int bus_command(const char *command_json, ecat_reply_t *out)
 {
     cJSON *root = cJSON_Parse(command_json);
@@ -2002,6 +2072,8 @@ static int bus_command(const char *command_json, ecat_reply_t *out)
         result = handle_stop_command(out);
     } else if (strcmp(name, "layout") == 0) {
         result = handle_layout_command(out);
+    } else if (strcmp(name, "scan-modules") == 0) {
+        result = handle_scan_modules_command(root, out);
     } else if (strcmp(name, "open_data") == 0) {
         result = handle_open_data_command(root, out);
     } else if (strcmp(name, "close_data") == 0) {

@@ -1177,3 +1177,84 @@ int ecat_master_get_slave_count(ecat_master_instance_t *inst)
         return 0;
     return inst->ecx_context.slavecount;
 }
+
+/*
+ * =============================================================================
+ * R3 (RTOP-319): 0xF050 module scan for ETG.5001 modular couplers
+ * =============================================================================
+ */
+
+int ecat_master_scan_modules(ecat_master_instance_t *inst, int slave_pos,
+                             uint32_t *idents_out, int max_idents, int *idents_out_count,
+                             char *err_msg, size_t err_size, edog_logger_t *logger)
+{
+    if (inst == NULL || idents_out == NULL || idents_out_count == NULL || max_idents <= 0) {
+        if (err_msg && err_size) snprintf(err_msg, err_size, "invalid arguments");
+        return -1;
+    }
+
+    *idents_out_count = 0;
+
+    if (!inst->soem_initialized) {
+        if (err_msg && err_size) snprintf(err_msg, err_size, "master not initialised");
+        return -1;
+    }
+    if (slave_pos < 1 || slave_pos > inst->ecx_context.slavecount) {
+        if (err_msg && err_size)
+            snprintf(err_msg, err_size, "slave position %d out of range (1..%d)",
+                     slave_pos, inst->ecx_context.slavecount);
+        return -1;
+    }
+    if ((inst->ecx_context.slavelist[slave_pos].mbx_proto & 0x04) == 0) {
+        if (err_msg && err_size)
+            snprintf(err_msg, err_size, "slave %d does not support CoE mailbox", slave_pos);
+        return -1;
+    }
+
+    /* Step 1: read 0xF050:0 to get the configured module count. */
+    uint8_t subcount = 0;
+    int size = (int)sizeof(subcount);
+    int wkc = ecx_SDOread(&inst->ecx_context, (uint16)slave_pos,
+                          0xF050, 0, FALSE, &size, &subcount, EC_TIMEOUTRXM);
+    if (wkc <= 0 || size != (int)sizeof(subcount)) {
+        if (err_msg && err_size)
+            snprintf(err_msg, err_size, "slave %d: 0xF050:0 read failed (wkc=%d)",
+                     slave_pos, wkc);
+        edog_log_warn(logger, "scan-modules slave=%d: 0xF050:0 read failed (wkc=%d)",
+                      slave_pos, wkc);
+        return -1;
+    }
+
+    int n = (int)subcount;
+    if (n < 0) n = 0;
+    if (n > max_idents) {
+        if (err_msg && err_size)
+            snprintf(err_msg, err_size, "slave %d: 0xF050 reports %d modules, buffer holds %d",
+                     slave_pos, n, max_idents);
+        return -1;
+    }
+
+    /* Step 2: read 0xF050:1..n each as a UDINT. Short-circuit on the first failure so
+     * the caller sees the bad sub-index rather than a silently truncated list. */
+    for (int i = 1; i <= n; i++) {
+        uint32_t ident = 0;
+        size = (int)sizeof(ident);
+        wkc = ecx_SDOread(&inst->ecx_context, (uint16)slave_pos,
+                          0xF050, (uint8)i, FALSE, &size, &ident, EC_TIMEOUTRXM);
+        if (wkc <= 0 || size != (int)sizeof(ident)) {
+            if (err_msg && err_size)
+                snprintf(err_msg, err_size,
+                         "slave %d: 0xF050:%d read failed (wkc=%d, size=%d)",
+                         slave_pos, i, wkc, size);
+            edog_log_warn(logger,
+                "scan-modules slave=%d: 0xF050:%d read failed (wkc=%d)",
+                slave_pos, i, wkc);
+            return -1;
+        }
+        idents_out[i - 1] = ident;
+    }
+
+    *idents_out_count = n;
+    edog_log_info(logger, "scan-modules slave=%d: %d module idents read", slave_pos, n);
+    return 0;
+}

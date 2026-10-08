@@ -251,4 +251,25 @@ size_t ecat_master_get_iomap_size(ecat_master_instance_t *inst);
  */
 int ecat_master_get_slave_count(ecat_master_instance_t *inst);
 
+/*
+ * R3 (RTOP-319): scan 0xF050 (detected module list) on an ETG.5001 modular coupler.
+ *
+ * 0xF050:0 holds the module count and 0xF050:1..N each hold a UDINT ident in slot order.
+ * A slave that does not implement 0xF050 returns an SDO abort; the function then surfaces
+ * the SDO error. The output buffer is caller-owned.
+ *
+ * @param inst              Master instance (SOEM must be initialised).
+ * @param slave_pos         1-based slave position.
+ * @param idents_out        Caller-owned array of at least @p max_idents uint32_t slots.
+ * @param max_idents        Capacity of @p idents_out.
+ * @param idents_out_count  Written: number of idents returned.
+ * @param err_msg           Written: short error message when the return value is non-zero.
+ * @param err_size          Capacity of @p err_msg.
+ * @param logger            Diagnostic logger.
+ * @return 0 on success, -1 on error (unreachable slave, SDO abort, buffer too small).
+ */
+int ecat_master_scan_modules(ecat_master_instance_t *inst, int slave_pos,
+                             uint32_t *idents_out, int max_idents, int *idents_out_count,
+                             char *err_msg, size_t err_size, edog_logger_t *logger);
+
 #endif /* ETHERCAT_MASTER_H */
