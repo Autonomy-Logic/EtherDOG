@@ -173,12 +173,22 @@ static char g_state_dir[256] = EDOG_DEFAULT_STATE_DIR;
  */
 static void publish_slaves_snapshot(ecat_master_instance_t *inst)
 {
-    ecat_slave_status_t local[ECAT_MAX_SLAVES];
-    memset(local, 0, sizeof(local));
+    /* RTOP-319 R1: snapshot buffer is heap-allocated with capacity = config.slave_count
+     * once at master start. If allocation never happened (test fixtures that bypass
+     * master_open_and_scan) or capacity is zero, skip -- there's nothing to publish. */
+    if (inst->slaves_snapshot == NULL || inst->slaves_snapshot_capacity <= 0)
+        return;
 
     int n = inst->config.slave_count;
-    if (n > ECAT_MAX_SLAVES)
-        n = ECAT_MAX_SLAVES;
+    if (n > inst->slaves_snapshot_capacity)
+        n = inst->slaves_snapshot_capacity;
+    if (n < 0) n = 0;
+
+    /* Build into a stack-free local heap buffer so the critical section under the mutex
+     * stays short (memcpy only). */
+    ecat_slave_status_t *local = (ecat_slave_status_t *)calloc((size_t)(n > 0 ? n : 1),
+                                                                sizeof(ecat_slave_status_t));
+    if (local == NULL) return; /* OOM at steady state is logged by the caller's path */
 
     for (int i = 0; i < n; i++) {
         const ecat_slave_t *cfg = &inst->config.slaves[i];
@@ -196,9 +206,12 @@ static void publish_slaves_snapshot(ecat_master_instance_t *inst)
     }
 
     pthread_mutex_lock(&inst->slaves_mutex);
-    memcpy(inst->slaves_snapshot, local, sizeof(local));
+    if (n > 0)
+        memcpy(inst->slaves_snapshot, local, (size_t)n * sizeof(ecat_slave_status_t));
     inst->slaves_snapshot_count = n;
     pthread_mutex_unlock(&inst->slaves_mutex);
+
+    free(local);
 }
 
 #if ECAT_ENABLE_MONITOR_THREAD
@@ -1057,6 +1070,8 @@ static void free_masters(void)
     for (int i = 0; i < g_master_count; i++) {
         ecat_master_instance_t *inst = &g_masters[i];
         ecat_data_destroy(inst);
+        /* RTOP-319 R1: release iomap, slaves_snapshot, config and layout owned heap. */
+        ecat_master_instance_destroy(inst);
         pthread_mutex_destroy(&inst->slaves_mutex);
     }
     free(g_masters);
@@ -1108,7 +1123,12 @@ int ecat_bus_configure(const char *path, char *err, size_t err_size)
         if (init_instance_locks(&temp[i]) != 0) {
             for (int j = 0; j < i; j++) {
                 ecat_data_destroy(&temp[j]);
+                ecat_master_instance_destroy(&temp[j]);
                 pthread_mutex_destroy(&temp[j].slaves_mutex);
+            }
+            /* And release the parsed configs for the instances we never init-locked. */
+            for (int j = i; j < count; j++) {
+                ecat_config_destroy(&temp[j].config);
             }
             free(temp);
             snprintf(err, err_size, "failed to initialize master locks");
@@ -1547,14 +1567,28 @@ static void load_diag_view(const ecat_master_instance_t *inst,
 static void add_slaves_json(ecat_master_instance_t *inst, cJSON *master,
                             int *out_count, bool diagnostics)
 {
-    ecat_slave_status_t local[ECAT_MAX_SLAVES];
-    int n;
+    *out_count = 0;
 
+    /* RTOP-319 R1: snapshot buffer is heap-allocated; copy under the mutex into a local
+     * heap buffer sized to the published count, then release the lock before building JSON. */
     pthread_mutex_lock(&inst->slaves_mutex);
-    n = inst->slaves_snapshot_count;
-    if (n > ECAT_MAX_SLAVES)
-        n = ECAT_MAX_SLAVES;
-    memcpy(local, inst->slaves_snapshot, sizeof(local));
+    int n = inst->slaves_snapshot_count;
+    if (inst->slaves_snapshot == NULL || n <= 0) {
+        pthread_mutex_unlock(&inst->slaves_mutex);
+        cJSON_AddArrayToObject(master, "slaves");
+        return;
+    }
+    if (n > inst->slaves_snapshot_capacity)
+        n = inst->slaves_snapshot_capacity;
+
+    ecat_slave_status_t *local = (ecat_slave_status_t *)calloc((size_t)n,
+                                                                sizeof(ecat_slave_status_t));
+    if (local == NULL) {
+        pthread_mutex_unlock(&inst->slaves_mutex);
+        cJSON_AddArrayToObject(master, "slaves");
+        return;
+    }
+    memcpy(local, inst->slaves_snapshot, (size_t)n * sizeof(ecat_slave_status_t));
     pthread_mutex_unlock(&inst->slaves_mutex);
 
     *out_count = n;
@@ -1575,6 +1609,8 @@ static void add_slaves_json(ecat_master_instance_t *inst, cJSON *master,
                               ss->al_state != EC_STATE_OPERATIONAL);
         cJSON_AddItemToArray(slaves, slave);
     }
+
+    free(local);
 }
 
 /**

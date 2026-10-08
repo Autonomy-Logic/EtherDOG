@@ -139,8 +139,18 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, edog_logger_t *logge
 
     /* Zero-initialize the SOEM context before use */
     memset(&inst->ecx_context, 0, sizeof(inst->ecx_context));
-    memset(inst->iomap, 0, sizeof(inst->iomap));
+
+    /* RTOP-319 R1: iomap and slaves_snapshot are heap-allocated once per bus start, sized
+     * from SOEM's post-ecx_config_init() slavelist and from config.slave_count. A reload
+     * path lands here with leftover state, so release before (re)allocating. */
+    free(inst->iomap);
+    inst->iomap = NULL;
+    inst->iomap_capacity = 0;
     inst->iomap_used_size = 0;
+    free(inst->slaves_snapshot);
+    inst->slaves_snapshot = NULL;
+    inst->slaves_snapshot_capacity = 0;
+    inst->slaves_snapshot_count = 0;
 
     /* Step 0: Apply per-iface external state (NIC tuning + IP-stack
      * isolation).  Reverted in ecat_master_close. */
@@ -211,6 +221,20 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, edog_logger_t *logge
         edog_log_info(logger,
             "  [%d] %s - vendor=0x%08X, product=0x%08X, rev=0x%08X",
             i, slave->name, slave->eep_man, slave->eep_id, slave->eep_rev);
+    }
+
+    /* RTOP-319 R1: allocate iomap (sized at config load) and slaves_snapshot (sized from
+     * config.slave_count) now that SOEM is initialised and before the bus thread needs them.
+     * Both allocations are freed by ecat_master_close on teardown. */
+    if (ecat_master_instance_alloc_iomap(inst) != 0) {
+        ecx_close(&inst->ecx_context);
+        inst->soem_initialized = 0;
+        return -1;
+    }
+    if (ecat_master_instance_alloc_snapshot(inst) != 0) {
+        ecx_close(&inst->ecx_context);
+        inst->soem_initialized = 0;
+        return -1;
     }
 
     /* Step 3: Validate topology against JSON configuration */
@@ -612,16 +636,19 @@ int ecat_master_configure(ecat_master_instance_t *inst, edog_logger_t *logger)
     /* Step 4: map process data. A size of 0 means SOEM could not lay out the PDOs. */
     edog_log_info(logger, "Mapping process data...");
 
-    int io_size = ecx_config_map_group(&inst->ecx_context, &inst->iomap, 0);
+    /* RTOP-319 R1: iomap is a heap-allocated buffer sized at ECAT_IOMAP_INITIAL_SIZE; pass
+     * the pointer directly rather than taking its address. */
+    int io_size = ecx_config_map_group(&inst->ecx_context, inst->iomap, 0);
     if (io_size <= 0) {
         edog_log_error(logger,
             "ecx_config_map_group returned %d -- process data mapping failed "
             "(likely SII / mailbox issue)", io_size);
         return -1;
     }
-    if (io_size > ECAT_IOMAP_SIZE) {
-        edog_log_error(logger, "IOmap overflow: need %d bytes, have %d",
-                            io_size, ECAT_IOMAP_SIZE);
+    if ((size_t)io_size > inst->iomap_capacity) {
+        edog_log_error(logger,
+            "IOmap overflow: need %d bytes, allocated %zu (raise ECAT_IOMAP_INITIAL_SIZE)",
+            io_size, inst->iomap_capacity);
         return -1;
     }
 
@@ -865,9 +892,20 @@ void ecat_master_close(ecat_master_instance_t *inst, edog_logger_t *logger)
      * flags and is a no-op when nothing was applied. */
     ecat_iface_state_revert(&inst->iface_state, logger);
 
-    /* Clear IO map */
-    memset(inst->iomap, 0, sizeof(inst->iomap));
+    /* Clear IO map and release the heap buffer. Also release the snapshot buffer; a
+     * subsequent open_and_scan reallocates both. (RTOP-319 R1 lifecycle.) */
+    if (inst->iomap != NULL && inst->iomap_capacity > 0) {
+        memset(inst->iomap, 0, inst->iomap_capacity);
+    }
+    free(inst->iomap);
+    inst->iomap = NULL;
+    inst->iomap_capacity = 0;
     inst->iomap_used_size = 0;
+
+    free(inst->slaves_snapshot);
+    inst->slaves_snapshot = NULL;
+    inst->slaves_snapshot_capacity = 0;
+    inst->slaves_snapshot_count = 0;
 
     edog_log_info(logger, "EtherCAT master closed");
 }

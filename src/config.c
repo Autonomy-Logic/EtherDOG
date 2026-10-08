@@ -346,7 +346,10 @@ static int parse_pdo_entry(const cJSON *entry_json, ecat_pdo_entry_t *entry)
 }
 
 /**
- * @brief Parse a single PDO from JSON
+ * @brief Parse a single PDO from JSON. Allocates pdo->entries sized from the JSON array.
+ *
+ * @p pdo must be zero-initialized; on OOM returns ECAT_CONFIG_ERR_MEMORY and leaves pdo
+ * in a destroy-safe state (NULL entries, zero counts).
  */
 static int parse_pdo(const cJSON *pdo_json, ecat_pdo_t *pdo)
 {
@@ -357,19 +360,32 @@ static int parse_pdo(const cJSON *pdo_json, ecat_pdo_t *pdo)
     safe_strcpy(pdo->index, get_string(pdo_json, "index", "0x0000"), sizeof(pdo->index));
     safe_strcpy(pdo->name, get_string(pdo_json, "name", ""), sizeof(pdo->name));
 
+    pdo->entries = NULL;
     pdo->entry_count = 0;
+    pdo->entry_capacity = 0;
+
     const cJSON *entries = cJSON_GetObjectItemCaseSensitive(pdo_json, "entries");
-    if (entries != NULL && cJSON_IsArray(entries)) {
-        const cJSON *entry_json;
-        cJSON_ArrayForEach(entry_json, entries) {
-            if (pdo->entry_count >= ECAT_MAX_PDO_ENTRIES) {
-                edog_log_error(g_config_logger, "PDO %s has more than %d entries", pdo->index,
-                               ECAT_MAX_PDO_ENTRIES);
-                return ECAT_CONFIG_ERR_INVALID;
-            }
-            if (parse_pdo_entry(entry_json, &pdo->entries[pdo->entry_count]) == ECAT_CONFIG_OK) {
-                pdo->entry_count++;
-            }
+    if (entries == NULL || !cJSON_IsArray(entries)) {
+        return ECAT_CONFIG_OK;
+    }
+
+    int n = cJSON_GetArraySize(entries);
+    if (n <= 0) {
+        return ECAT_CONFIG_OK;
+    }
+
+    pdo->entries = (ecat_pdo_entry_t *)calloc((size_t)n, sizeof(ecat_pdo_entry_t));
+    if (pdo->entries == NULL) {
+        edog_log_error(g_config_logger, "PDO %s: out of memory allocating %d entries",
+                       pdo->index, n);
+        return ECAT_CONFIG_ERR_MEMORY;
+    }
+    pdo->entry_capacity = n;
+
+    const cJSON *entry_json;
+    cJSON_ArrayForEach(entry_json, entries) {
+        if (parse_pdo_entry(entry_json, &pdo->entries[pdo->entry_count]) == ECAT_CONFIG_OK) {
+            pdo->entry_count++;
         }
     }
 
@@ -377,24 +393,38 @@ static int parse_pdo(const cJSON *pdo_json, ecat_pdo_t *pdo)
 }
 
 /**
- * @brief Parse an array of PDOs (rx_pdos or tx_pdos) from JSON
+ * @brief Parse an array of PDOs (rx_pdos or tx_pdos) from JSON. Allocates *pdos_out.
+ *
+ * The buffer in *pdos_out is sized from the JSON array length and populated in place. On any
+ * error, the caller must call ecat_slave_destroy() (or walk+free the partially filled
+ * entries) to release what was allocated.
  */
-static int parse_pdo_array(const cJSON *pdo_array, ecat_pdo_t *pdos, int *pdo_count)
+static int parse_pdo_array(const cJSON *pdo_array, ecat_pdo_t **pdos_out,
+                           int *pdo_count, int *pdo_capacity)
 {
+    *pdos_out = NULL;
     *pdo_count = 0;
+    *pdo_capacity = 0;
 
     if (pdo_array == NULL || !cJSON_IsArray(pdo_array)) {
         return ECAT_CONFIG_OK;
     }
 
-    /* Truncating would program a PDO assignment that is not the configured one, so refuse */
+    int n = cJSON_GetArraySize(pdo_array);
+    if (n <= 0) {
+        return ECAT_CONFIG_OK;
+    }
+
+    *pdos_out = (ecat_pdo_t *)calloc((size_t)n, sizeof(ecat_pdo_t));
+    if (*pdos_out == NULL) {
+        edog_log_error(g_config_logger, "out of memory allocating %d PDOs", n);
+        return ECAT_CONFIG_ERR_MEMORY;
+    }
+    *pdo_capacity = n;
+
     const cJSON *pdo_json;
     cJSON_ArrayForEach(pdo_json, pdo_array) {
-        if (*pdo_count >= ECAT_MAX_PDOS) {
-            edog_log_error(g_config_logger, "more than %d PDOs in one direction", ECAT_MAX_PDOS);
-            return ECAT_CONFIG_ERR_INVALID;
-        }
-        int rc = parse_pdo(pdo_json, &pdos[*pdo_count]);
+        int rc = parse_pdo(pdo_json, &(*pdos_out)[*pdo_count]);
         if (rc != ECAT_CONFIG_OK)
             return rc;
         (*pdo_count)++;
@@ -541,37 +571,47 @@ static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
     slave->product_code = hex_to_uint32(get_string(slave_json, "product_code", "0x0"));
     slave->revision = hex_to_uint32(get_string(slave_json, "revision", "0x0"));
 
-    /* Parse channels */
-    slave->channel_count = 0;
+    /* Parse channels. Allocate sized exactly to the JSON array; the caller invokes
+     * ecat_slave_destroy() on error, which releases every pointer we allocated here. */
     const cJSON *channels = cJSON_GetObjectItemCaseSensitive(slave_json, "channels");
     if (channels != NULL && cJSON_IsArray(channels)) {
+        int n = cJSON_GetArraySize(channels);
+        if (n > 0) {
+            slave->channels = (ecat_channel_t *)calloc((size_t)n, sizeof(ecat_channel_t));
+            if (slave->channels == NULL) {
+                edog_log_error(g_config_logger,
+                    "Slave '%s' position %d: out of memory allocating %d channels",
+                    slave->name, slave->position, n);
+                return ECAT_CONFIG_ERR_MEMORY;
+            }
+            slave->channel_capacity = n;
+        }
         const cJSON *ch_json;
         cJSON_ArrayForEach(ch_json, channels) {
-            if (slave->channel_count >= ECAT_MAX_CHANNELS) {
-                edog_log_error(g_config_logger, "Slave '%s' position %d: more than %d channels",
-                               slave->name, slave->position, ECAT_MAX_CHANNELS);
-                return ECAT_CONFIG_ERR_INVALID;
-            }
             if (parse_channel(ch_json, &slave->channels[slave->channel_count]) == ECAT_CONFIG_OK) {
                 slave->channel_count++;
             }
         }
     }
 
-    /* Parse SDO configurations.  A malformed SDO aborts the slave entirely:
-     * a partial SDO write set leaves the slave in an undefined state, so
-     * fail-fast at parse time forces the operator to fix the JSON. */
-    slave->sdo_count = 0;
+    /* Parse SDO configurations. A malformed SDO aborts the slave entirely: a partial SDO
+     * write set leaves the slave in an undefined state, so fail-fast at parse time forces
+     * the operator to fix the JSON. */
     const cJSON *sdos = cJSON_GetObjectItemCaseSensitive(slave_json, "sdo_configurations");
     if (sdos != NULL && cJSON_IsArray(sdos)) {
+        int n = cJSON_GetArraySize(sdos);
+        if (n > 0) {
+            slave->sdo_configs = (ecat_sdo_config_t *)calloc((size_t)n, sizeof(ecat_sdo_config_t));
+            if (slave->sdo_configs == NULL) {
+                edog_log_error(g_config_logger,
+                    "Slave '%s' position %d: out of memory allocating %d SDOs",
+                    slave->name, slave->position, n);
+                return ECAT_CONFIG_ERR_MEMORY;
+            }
+            slave->sdo_capacity = n;
+        }
         const cJSON *sdo_json;
         cJSON_ArrayForEach(sdo_json, sdos) {
-            if (slave->sdo_count >= ECAT_MAX_SDOS) {
-                edog_log_error(g_config_logger,
-                    "Slave '%s' position %d: SDO count exceeds ECAT_MAX_SDOS=%d",
-                    slave->name, slave->position, ECAT_MAX_SDOS);
-                return ECAT_CONFIG_ERR_INVALID;
-            }
             int prc = parse_sdo(sdo_json, &slave->sdo_configs[slave->sdo_count]);
             if (prc != ECAT_CONFIG_OK) {
                 edog_log_error(g_config_logger,
@@ -584,13 +624,22 @@ static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
     }
 
     /* Parse RxPDOs and TxPDOs */
-    if (parse_pdo_array(cJSON_GetObjectItemCaseSensitive(slave_json, "rx_pdos"), slave->rx_pdos,
-                        &slave->rx_pdo_count) != ECAT_CONFIG_OK ||
-        parse_pdo_array(cJSON_GetObjectItemCaseSensitive(slave_json, "tx_pdos"), slave->tx_pdos,
-                        &slave->tx_pdo_count) != ECAT_CONFIG_OK) {
-        edog_log_error(g_config_logger, "Slave '%s' position %d: invalid PDO configuration",
-                       slave->name, slave->position);
-        return ECAT_CONFIG_ERR_INVALID;
+    int prc;
+    prc = parse_pdo_array(cJSON_GetObjectItemCaseSensitive(slave_json, "rx_pdos"),
+                          &slave->rx_pdos, &slave->rx_pdo_count, &slave->rx_pdo_capacity);
+    if (prc != ECAT_CONFIG_OK) {
+        edog_log_error(g_config_logger,
+            "Slave '%s' position %d: invalid RxPDO configuration (rc=%d)",
+            slave->name, slave->position, prc);
+        return prc;
+    }
+    prc = parse_pdo_array(cJSON_GetObjectItemCaseSensitive(slave_json, "tx_pdos"),
+                          &slave->tx_pdos, &slave->tx_pdo_count, &slave->tx_pdo_capacity);
+    if (prc != ECAT_CONFIG_OK) {
+        edog_log_error(g_config_logger,
+            "Slave '%s' position %d: invalid TxPDO configuration (rc=%d)",
+            slave->name, slave->position, prc);
+        return prc;
     }
 
     /* Parse per-slave configuration (defaults applied if "config" is absent) */
@@ -673,22 +722,29 @@ static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
 }
 
 /**
- * @brief Parse the slaves array from JSON
+ * @brief Parse the slaves array from JSON. Allocates config->slaves sized exactly to the
+ * JSON array; the caller invokes ecat_config_destroy() on error.
  */
 static int parse_slaves_section(const cJSON *slaves, ecat_config_t *config)
 {
-    config->slave_count = 0;
-
     if (slaves == NULL || !cJSON_IsArray(slaves)) {
         return ECAT_CONFIG_OK;
     }
 
+    int n = cJSON_GetArraySize(slaves);
+    if (n <= 0) {
+        return ECAT_CONFIG_OK;
+    }
+
+    config->slaves = (ecat_slave_t *)calloc((size_t)n, sizeof(ecat_slave_t));
+    if (config->slaves == NULL) {
+        edog_log_error(g_config_logger, "out of memory allocating %d slaves", n);
+        return ECAT_CONFIG_ERR_MEMORY;
+    }
+    config->slave_capacity = n;
+
     const cJSON *slave_json;
     cJSON_ArrayForEach(slave_json, slaves) {
-        if (config->slave_count >= ECAT_MAX_SLAVES) {
-            edog_log_error(g_config_logger, "more than %d slaves on one master", ECAT_MAX_SLAVES);
-            return ECAT_CONFIG_ERR_INVALID;
-        }
         int prc = parse_slave(slave_json, &config->slaves[config->slave_count]);
         if (prc != ECAT_CONFIG_OK) {
             /* parse_slave already logged the specific reason; propagate. */
@@ -783,6 +839,7 @@ int ecat_config_parse(const char *config_path, ecat_config_t *config)
     parse_master_section(cJSON_GetObjectItemCaseSensitive(config_obj, "master"), &config->master);
     int srs = parse_slaves_section(cJSON_GetObjectItemCaseSensitive(config_obj, "slaves"), config);
     if (srs != ECAT_CONFIG_OK) {
+        ecat_config_destroy(config);
         cJSON_Delete(root);
         return srs;
     }
@@ -791,7 +848,11 @@ int ecat_config_parse(const char *config_path, ecat_config_t *config)
     cJSON_Delete(root);
 
     /* Validate the parsed configuration */
-    return ecat_config_validate(config);
+    int vrs = ecat_config_validate(config);
+    if (vrs != ECAT_CONFIG_OK) {
+        ecat_config_destroy(config);
+    }
+    return vrs;
 }
 
 int ecat_config_parse_all(const char *config_path,
@@ -833,6 +894,7 @@ int ecat_config_parse_all(const char *config_path,
         int srs = parse_slaves_section(cJSON_GetObjectItemCaseSensitive(config_obj, "slaves"),
                                        &instances[0].config);
         if (srs != ECAT_CONFIG_OK) {
+            ecat_config_destroy(&instances[0].config);
             cJSON_Delete(root);
             return srs;
         }
@@ -842,6 +904,8 @@ int ecat_config_parse_all(const char *config_path,
         int result = ecat_config_validate(&instances[0].config);
         if (result == ECAT_CONFIG_OK) {
             *out_count = 1;
+        } else {
+            ecat_config_destroy(&instances[0].config);
         }
         return result;
     }
@@ -890,6 +954,9 @@ int ecat_config_parse_all(const char *config_path,
             edog_log_error(g_config_logger,
                 "entry[%d] '%s': slaves section failed (rc=%d) -- aborting parse",
                 i, name, srs);
+            ecat_config_destroy(&instances[count].config);
+            for (int k = 0; k < count; k++)
+                ecat_config_destroy(&instances[k].config);
             cJSON_Delete(root);
             *out_count = 0;
             return srs;
@@ -905,6 +972,7 @@ int ecat_config_parse_all(const char *config_path,
             edog_log_error(g_config_logger,
                 "skipping entry[%d] '%s' (validation failed, error=%d)",
                 i, name, result);
+            ecat_config_destroy(&instances[count].config);
         }
     }
 
@@ -923,6 +991,8 @@ int ecat_config_parse_all(const char *config_path,
                     "not supported. Use a distinct interface per master.",
                     instances[i].name, instances[j].name,
                     instances[i].config.master.interface);
+                for (int k = 0; k < count; k++)
+                    ecat_config_destroy(&instances[k].config);
                 *out_count = 0;
                 return ECAT_CONFIG_ERR_INVALID;
             }
@@ -1041,4 +1111,160 @@ const char *ecat_data_type_to_string(ecat_data_type_t dt)
     case ECAT_DTYPE_PAD:     return "PAD";
     }
     return "UNKNOWN";
+}
+
+/*
+ * =============================================================================
+ * Destructors (RTOP-319 R1)
+ * =============================================================================
+ */
+
+void ecat_pdo_destroy(ecat_pdo_t *pdo)
+{
+    if (pdo == NULL) return;
+    free(pdo->entries);
+    pdo->entries = NULL;
+    pdo->entry_count = 0;
+    pdo->entry_capacity = 0;
+}
+
+void ecat_slave_destroy(ecat_slave_t *slave)
+{
+    if (slave == NULL) return;
+
+    free(slave->channels);
+    slave->channels = NULL;
+    slave->channel_count = 0;
+    slave->channel_capacity = 0;
+
+    free(slave->sdo_configs);
+    slave->sdo_configs = NULL;
+    slave->sdo_count = 0;
+    slave->sdo_capacity = 0;
+
+    if (slave->rx_pdos != NULL) {
+        for (int i = 0; i < slave->rx_pdo_count; i++)
+            ecat_pdo_destroy(&slave->rx_pdos[i]);
+        free(slave->rx_pdos);
+        slave->rx_pdos = NULL;
+    }
+    slave->rx_pdo_count = 0;
+    slave->rx_pdo_capacity = 0;
+
+    if (slave->tx_pdos != NULL) {
+        for (int i = 0; i < slave->tx_pdo_count; i++)
+            ecat_pdo_destroy(&slave->tx_pdos[i]);
+        free(slave->tx_pdos);
+        slave->tx_pdos = NULL;
+    }
+    slave->tx_pdo_count = 0;
+    slave->tx_pdo_capacity = 0;
+}
+
+void ecat_config_destroy(ecat_config_t *config)
+{
+    if (config == NULL) return;
+    if (config->slaves != NULL) {
+        for (int i = 0; i < config->slave_count; i++)
+            ecat_slave_destroy(&config->slaves[i]);
+        free(config->slaves);
+        config->slaves = NULL;
+    }
+    config->slave_count = 0;
+    config->slave_capacity = 0;
+}
+
+void ecat_layout_destroy(ecat_layout_t *layout)
+{
+    if (layout == NULL) return;
+    free(layout->entries);
+    layout->entries = NULL;
+    layout->entry_count = 0;
+    layout->entry_capacity = 0;
+    layout->output_bytes = 0;
+    layout->input_bytes = 0;
+}
+
+int ecat_layout_init(ecat_layout_t *layout, int capacity)
+{
+    if (layout == NULL || capacity < 0) return -1;
+    ecat_layout_destroy(layout);
+    if (capacity == 0) return 0;
+    layout->entries = (ecat_layout_entry_t *)calloc((size_t)capacity, sizeof(ecat_layout_entry_t));
+    if (layout->entries == NULL) {
+        edog_log_error(g_config_logger, "layout: out of memory allocating %d entries", capacity);
+        return -1;
+    }
+    layout->entry_capacity = capacity;
+    return 0;
+}
+
+/*
+ * Instance-level allocators. Both must be called before the bus thread starts, so no
+ * concurrency guards are needed: the allocation ordering is enforced in master.c and
+ * the two-consecutive-loads integration test is the gate for the lifecycle.
+ */
+int ecat_master_instance_alloc_iomap(ecat_master_instance_t *inst)
+{
+    if (inst == NULL) return -1;
+    if (inst->iomap != NULL) {
+        /* Already allocated; a reload path should have called _destroy first */
+        edog_log_error(g_config_logger, "iomap already allocated at reload; invariant broken");
+        return -1;
+    }
+
+    /* ecx_config_init populates slave identity but not Ibytes/Obytes -- those come from
+     * ecx_config_map_group, which needs the buffer passed in. We therefore allocate the
+     * initial size here and the caller fails the start if the mapping requires more.
+     * The macro replaces the old struct-embedded ECAT_IOMAP_SIZE; raising it is a
+     * one-constant tune, not a struct-layout change (RTOP-319 R1). */
+    inst->iomap = (uint8_t *)calloc(1, ECAT_IOMAP_INITIAL_SIZE);
+    if (inst->iomap == NULL) {
+        edog_log_error(g_config_logger, "iomap: out of memory allocating %d bytes",
+                       ECAT_IOMAP_INITIAL_SIZE);
+        return -1;
+    }
+    inst->iomap_capacity = ECAT_IOMAP_INITIAL_SIZE;
+    inst->iomap_used_size = 0;
+    return 0;
+}
+
+int ecat_master_instance_alloc_snapshot(ecat_master_instance_t *inst)
+{
+    if (inst == NULL) return -1;
+    if (inst->slaves_snapshot != NULL) {
+        edog_log_error(g_config_logger, "slaves_snapshot already allocated at reload");
+        return -1;
+    }
+    int n = inst->config.slave_count;
+    if (n <= 0) {
+        /* No slaves configured: still allocate one slot to keep readers simple */
+        n = 1;
+    }
+    inst->slaves_snapshot =
+        (ecat_slave_status_t *)calloc((size_t)n, sizeof(ecat_slave_status_t));
+    if (inst->slaves_snapshot == NULL) {
+        edog_log_error(g_config_logger, "slaves_snapshot: out of memory allocating %d slots", n);
+        return -1;
+    }
+    inst->slaves_snapshot_capacity = n;
+    inst->slaves_snapshot_count = 0;
+    return 0;
+}
+
+void ecat_master_instance_destroy(ecat_master_instance_t *inst)
+{
+    if (inst == NULL) return;
+    free(inst->iomap);
+    inst->iomap = NULL;
+    inst->iomap_capacity = 0;
+    inst->iomap_used_size = 0;
+
+    free(inst->slaves_snapshot);
+    inst->slaves_snapshot = NULL;
+    inst->slaves_snapshot_count = 0;
+    inst->slaves_snapshot_capacity = 0;
+
+    ecat_layout_destroy(&inst->layout);
+    ecat_config_destroy(&inst->config);
 }

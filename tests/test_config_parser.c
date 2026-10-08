@@ -383,32 +383,23 @@ static int parse_tmp(void)
     return ecat_config_parse_all(TMPFILE, g_instances, ECAT_MAX_MASTERS, &count);
 }
 
-void test_limits_AtEveryLimit_ShouldParse(void)
+/* RTOP-319 R1: per-slave and per-master size caps were removed; the parser allocates each
+ * array exactly to the JSON length. The former "AtEveryLimit" check becomes a station-scale
+ * acceptance test, and the three "TooMany" rejection tests no longer apply because there is
+ * no struct-level cap to exceed. OOM at parse time is logged and surfaces as
+ * ECAT_CONFIG_ERR_MEMORY, which cannot be exercised reproducibly from a unit test without a
+ * fault-injecting malloc; the two-consecutive-loads integration test covers lifecycle. */
+void test_limits_StationScale_ShouldParse(void)
 {
-    write_bus(ECAT_MAX_SLAVES, 1, 1);
+    /* 128 slaves, 64 PDOs per direction, 64 entries per PDO -- covers UR20 + headroom. */
+    write_bus(128, 1, 1);
     TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, parse_tmp());
-    write_bus(1, ECAT_MAX_PDOS, ECAT_MAX_PDO_ENTRIES);
+    TEST_ASSERT_EQUAL_INT(128, g_instances[0].config.slave_count);
+
+    write_bus(1, 64, 64);
     TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, parse_tmp());
-    TEST_ASSERT_EQUAL_INT(ECAT_MAX_PDOS, g_instances[0].config.slaves[0].rx_pdo_count);
-    TEST_ASSERT_EQUAL_INT(ECAT_MAX_PDO_ENTRIES, g_instances[0].config.slaves[0].rx_pdos[0].entry_count);
-}
-
-void test_limits_TooManyPdoEntries_ShouldReject(void)
-{
-    write_bus(1, 1, ECAT_MAX_PDO_ENTRIES + 1);
-    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_ERR_INVALID, parse_tmp());
-}
-
-void test_limits_TooManyPdos_ShouldReject(void)
-{
-    write_bus(1, ECAT_MAX_PDOS + 1, 1);
-    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_ERR_INVALID, parse_tmp());
-}
-
-void test_limits_TooManySlaves_ShouldReject(void)
-{
-    write_bus(ECAT_MAX_SLAVES + 1, 1, 1);
-    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_ERR_INVALID, parse_tmp());
+    TEST_ASSERT_EQUAL_INT(64, g_instances[0].config.slaves[0].rx_pdo_count);
+    TEST_ASSERT_EQUAL_INT(64, g_instances[0].config.slaves[0].rx_pdos[0].entry_count);
 }
 
 void test_limits_TooManyMasters_ShouldReject(void)

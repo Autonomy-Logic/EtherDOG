@@ -10,25 +10,40 @@
 #include "config.h"
 #include "unity.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 
 void setUp(void) {}
 void tearDown(void) {}
 
-/* Helper: a baseline configuration that should always validate as OK. */
+/* Helper: a baseline configuration that should always validate as OK.
+ *
+ * RTOP-319 R1: slaves and nested channel/sdo/pdo arrays are heap-allocated. Each test owns
+ * its config and is responsible for destroying it before re-initialising. The baseline
+ * allocates 2 slave slots so the duplicate-position test can populate two.
+ */
 static void baseline_config(ecat_config_t *config)
 {
+    ecat_config_destroy(config);
     ecat_config_init_defaults(config);
 
+    config->slaves = (ecat_slave_t *)calloc(2, sizeof(ecat_slave_t));
+    TEST_ASSERT_NOT_NULL(config->slaves);
+    config->slave_capacity = 2;
     config->slave_count = 1;
+
     ecat_slave_t *s = &config->slaves[0];
-    memset(s, 0, sizeof(*s));
     s->position = 1;
     s->vendor_id = 0x00000002;
     s->product_code = 0x00000001;
     s->revision = 0x00000001;
     snprintf(s->name, sizeof(s->name), "TestSlave");
+
+    /* Allocate one channel slot so the ChannelWithPdoEntry test can poke at index 0. */
+    s->channels = (ecat_channel_t *)calloc(1, sizeof(ecat_channel_t));
+    TEST_ASSERT_NOT_NULL(s->channels);
+    s->channel_capacity = 1;
     s->channel_count = 0;
 }
 

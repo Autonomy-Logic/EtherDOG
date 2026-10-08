@@ -36,7 +36,9 @@ uint8_t *ecat_layout_input_region(ecat_master_instance_t *inst)
     return inst->ecx_context.grouplist[0].inputs;
 }
 
-/* Publish one direction of one slave. Returns 0 or -1 on overflow. */
+/* Publish one direction of one slave. Returns 0 or -1 on capacity overflow (should not
+ * happen because the layout is sized from the config up front; the check is defense
+ * in depth against a reload race on the config). */
 static int add_direction(ecat_master_instance_t *inst, const ecat_slave_t *cfg,
                          const ec_slavet *soem, bool is_output, edog_logger_t *logger)
 {
@@ -66,9 +68,11 @@ static int add_direction(ecat_master_instance_t *inst, const ecat_slave_t *cfg,
         for (int e = 0; e < pdo->entry_count; e++) {
             const ecat_pdo_entry_t *entry = &pdo->entries[e];
             if (!is_padding(entry)) {
-                if (layout->entry_count >= ECAT_MAX_LAYOUT_ENTRIES) {
-                    edog_log_error(logger, "Master '%s': layout full (%d entries)", inst->name,
-                                   ECAT_MAX_LAYOUT_ENTRIES);
+                if (layout->entry_count >= layout->entry_capacity) {
+                    edog_log_error(logger,
+                        "Master '%s': layout full (capacity %d; invariant broken, config"
+                        " and layout out of sync)",
+                        inst->name, layout->entry_capacity);
                     return -1;
                 }
                 ecat_layout_entry_t *out = &layout->entries[layout->entry_count++];
@@ -92,10 +96,34 @@ static int add_direction(ecat_master_instance_t *inst, const ecat_slave_t *cfg,
     return 0;
 }
 
+/* Upper bound on the layout: sum of PDO entries (padding included) across both directions
+ * for every configured slave. Padding entries don't produce layout rows but the headroom
+ * is cheap and keeps the allocation deterministic from the config alone. */
+static int count_layout_max(const ecat_config_t *cfg)
+{
+    int total = 0;
+    for (int s = 0; s < cfg->slave_count; s++) {
+        const ecat_slave_t *sv = &cfg->slaves[s];
+        for (int i = 0; i < sv->rx_pdo_count; i++)
+            total += sv->rx_pdos[i].entry_count;
+        for (int i = 0; i < sv->tx_pdo_count; i++)
+            total += sv->tx_pdos[i].entry_count;
+    }
+    return total;
+}
+
 int ecat_layout_build(ecat_master_instance_t *inst, edog_logger_t *logger)
 {
     ecat_layout_t *layout = &inst->layout;
-    memset(layout, 0, sizeof(*layout));
+
+    /* ecat_layout_init frees any previous allocation and installs a fresh buffer sized
+     * from the current config, so a reload path lands here naturally. */
+    int max_entries = count_layout_max(&inst->config);
+    if (ecat_layout_init(layout, max_entries) != 0) {
+        edog_log_error(logger, "Master '%s': layout allocation failed (%d entries)",
+                       inst->name, max_entries);
+        return -1;
+    }
 
     if (!inst->soem_initialized) {
         edog_log_error(logger, "Master '%s': layout requested before mapping", inst->name);
