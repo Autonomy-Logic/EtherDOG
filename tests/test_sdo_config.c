@@ -14,6 +14,7 @@
 #include "unity.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 
@@ -275,5 +276,105 @@ void test_sdo_parse_StringLargeHex_ShouldParseCorrectly(void)
     TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, rc);
     TEST_ASSERT_DOUBLE_WITHIN(0.001, 6699.0, config.slaves[0].sdo_configs[0].value);
 
+    cleanup_temp();
+}
+
+/* ---- R2 (RTOP-319): byte-string payload + complete_access ---- */
+
+/* Minimal config with a slave and one SDO carrying the given extra JSON fields. */
+static int write_sdo_json_fields(const char *extra_fields)
+{
+    FILE *fp = fopen(TEMP_FILE, "w");
+    if (!fp)
+        return -1;
+    fprintf(fp,
+        "[{\"name\":\"m\",\"protocol\":\"ETHERCAT\",\"config\":{"
+        "\"master\":{\"interface\":\"eth0\",\"cycle_time_us\":1000,\"receive_timeout_us\":2000},"
+        "\"slaves\":[{\"position\":1,\"name\":\"S\",\"type\":\"coupler\","
+        "\"vendor_id\":\"0x2\",\"product_code\":\"0x1\",\"revision\":\"0x1\","
+        "\"sdo_configurations\":[{\"index\":\"0x8000\",\"subindex\":3,"
+        "\"data_type\":\"UINT8\",%s}],"
+        "\"rx_pdos\":[],\"tx_pdos\":[]}]}}]",
+        extra_fields);
+    fclose(fp);
+    return 0;
+}
+
+void test_sdo_parse_ByteStringAscii_ShouldStoreBytes(void)
+{
+    write_sdo_json_fields("\"value_bytes\":\"UR20-4DI-P\"");
+
+    static ecat_config_t config;
+    int rc = ecat_config_parse(TEMP_FILE, &config);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, rc);
+
+    const ecat_sdo_config_t *sdo = &config.slaves[0].sdo_configs[0];
+    TEST_ASSERT_NOT_NULL(sdo->value_bytes);
+    TEST_ASSERT_EQUAL_INT(10, (int)sdo->value_bytes_len);
+    TEST_ASSERT_EQUAL_MEMORY("UR20-4DI-P", sdo->value_bytes, 10);
+    TEST_ASSERT_FALSE(sdo->complete_access);
+
+    ecat_config_destroy(&config);
+    cleanup_temp();
+}
+
+void test_sdo_parse_ByteStringHex_ShouldDecodeHexPairs(void)
+{
+    write_sdo_json_fields("\"value_bytes\":\"0xDEADBEEF\"");
+
+    static ecat_config_t config;
+    int rc = ecat_config_parse(TEMP_FILE, &config);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, rc);
+
+    const ecat_sdo_config_t *sdo = &config.slaves[0].sdo_configs[0];
+    TEST_ASSERT_NOT_NULL(sdo->value_bytes);
+    TEST_ASSERT_EQUAL_INT(4, (int)sdo->value_bytes_len);
+    TEST_ASSERT_EQUAL_HEX8(0xDE, sdo->value_bytes[0]);
+    TEST_ASSERT_EQUAL_HEX8(0xAD, sdo->value_bytes[1]);
+    TEST_ASSERT_EQUAL_HEX8(0xBE, sdo->value_bytes[2]);
+    TEST_ASSERT_EQUAL_HEX8(0xEF, sdo->value_bytes[3]);
+
+    ecat_config_destroy(&config);
+    cleanup_temp();
+}
+
+void test_sdo_parse_ByteStringHexOddNibbles_ShouldReject(void)
+{
+    write_sdo_json_fields("\"value_bytes\":\"0xABC\"");
+
+    static ecat_config_t config;
+    int rc = ecat_config_parse(TEMP_FILE, &config);
+    TEST_ASSERT_NOT_EQUAL(ECAT_CONFIG_OK, rc);
+
+    cleanup_temp();
+}
+
+void test_sdo_parse_CompleteAccessTrue_ShouldSetFlag(void)
+{
+    write_sdo_json_fields("\"value\":42,\"complete_access\":true");
+
+    static ecat_config_t config;
+    int rc = ecat_config_parse(TEMP_FILE, &config);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, rc);
+
+    TEST_ASSERT_TRUE(config.slaves[0].sdo_configs[0].complete_access);
+    TEST_ASSERT_DOUBLE_WITHIN(0.001, 42.0, config.slaves[0].sdo_configs[0].value);
+    TEST_ASSERT_NULL(config.slaves[0].sdo_configs[0].value_bytes);
+
+    ecat_config_destroy(&config);
+    cleanup_temp();
+}
+
+void test_sdo_parse_CompleteAccessDefault_ShouldBeFalse(void)
+{
+    write_sdo_json_fields("\"value\":1");
+
+    static ecat_config_t config;
+    int rc = ecat_config_parse(TEMP_FILE, &config);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, rc);
+
+    TEST_ASSERT_FALSE(config.slaves[0].sdo_configs[0].complete_access);
+
+    ecat_config_destroy(&config);
     cleanup_temp();
 }

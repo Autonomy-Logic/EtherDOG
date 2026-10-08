@@ -517,15 +517,68 @@ static int parse_sdo(const cJSON *sdo_json, ecat_sdo_config_t *sdo)
         return ECAT_CONFIG_ERR_INVALID;
     }
 
-    /* value: optional with default 0.  When present must fit the wire type. */
-    sdo->value = get_numeric_value(sdo_json, "value", 0.0);
-    if (!sdo_value_in_range(sdo->parsed_type, sdo->value)) {
-        edog_log_error(g_config_logger,
-            "SDO %s:%d 'value' %g out of range for type %s",
-            sdo->index, sdo->subindex, sdo->value,
-            ecat_data_type_to_string(sdo->parsed_type));
-        return ECAT_CONFIG_ERR_INVALID;
+    /* R2: optional "value_bytes" overrides "value" and carries a raw byte string. Two
+     * input shapes: a plain string ("UR20-4DI-P") is taken as its UTF-8 bytes, and a
+     * "0x..." prefix is parsed as hex pairs. When present, the numeric value and the
+     * range check are skipped: the payload wire-type is the bytes themselves. */
+    sdo->value_bytes = NULL;
+    sdo->value_bytes_len = 0;
+    const cJSON *vbytes = cJSON_GetObjectItemCaseSensitive(sdo_json, "value_bytes");
+    if (cJSON_IsString(vbytes) && vbytes->valuestring != NULL) {
+        const char *s = vbytes->valuestring;
+        size_t slen = strlen(s);
+        if (slen >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+            /* Hex-pair form "0xAABB..". Odd nibble counts after the prefix are rejected. */
+            size_t hexlen = slen - 2;
+            if (hexlen == 0 || (hexlen % 2) != 0) {
+                edog_log_error(g_config_logger,
+                    "SDO %s:%d 'value_bytes' hex payload must be an even nibble count",
+                    sdo->index, sdo->subindex);
+                return ECAT_CONFIG_ERR_INVALID;
+            }
+            size_t n = hexlen / 2;
+            uint8_t *buf = (uint8_t *)calloc(n > 0 ? n : 1, 1);
+            if (buf == NULL) return ECAT_CONFIG_ERR_MEMORY;
+            for (size_t k = 0; k < n; k++) {
+                char pair[3] = { s[2 + 2 * k], s[2 + 2 * k + 1], '\0' };
+                char *endp = NULL;
+                long v = strtol(pair, &endp, 16);
+                if (endp != pair + 2 || v < 0 || v > 0xFF) {
+                    free(buf);
+                    edog_log_error(g_config_logger,
+                        "SDO %s:%d 'value_bytes' non-hex byte at offset %zu",
+                        sdo->index, sdo->subindex, k);
+                    return ECAT_CONFIG_ERR_INVALID;
+                }
+                buf[k] = (uint8_t)v;
+            }
+            sdo->value_bytes = buf;
+            sdo->value_bytes_len = n;
+        } else {
+            /* ASCII/UTF-8 string form. The trailing NUL is NOT included: a CANopen
+             * VISIBLE_STRING written to 0x80n0:03 is the characters, not the terminator. */
+            uint8_t *buf = (uint8_t *)calloc(slen > 0 ? slen : 1, 1);
+            if (buf == NULL) return ECAT_CONFIG_ERR_MEMORY;
+            memcpy(buf, s, slen);
+            sdo->value_bytes = buf;
+            sdo->value_bytes_len = slen;
+        }
+        /* Keep value_num at 0; the write path checks value_bytes first. */
+        sdo->value = 0.0;
+    } else {
+        /* value: optional with default 0.  When present must fit the wire type. */
+        sdo->value = get_numeric_value(sdo_json, "value", 0.0);
+        if (!sdo_value_in_range(sdo->parsed_type, sdo->value)) {
+            edog_log_error(g_config_logger,
+                "SDO %s:%d 'value' %g out of range for type %s",
+                sdo->index, sdo->subindex, sdo->value,
+                ecat_data_type_to_string(sdo->parsed_type));
+            return ECAT_CONFIG_ERR_INVALID;
+        }
     }
+
+    /* R2: optional "complete_access" flag defaults false. */
+    sdo->complete_access = get_bool(sdo_json, "complete_access", false);
 
     safe_strcpy(sdo->name, get_string(sdo_json, "name", ""), sizeof(sdo->name));
     return ECAT_CONFIG_OK;
@@ -1137,8 +1190,16 @@ void ecat_slave_destroy(ecat_slave_t *slave)
     slave->channel_count = 0;
     slave->channel_capacity = 0;
 
-    free(slave->sdo_configs);
-    slave->sdo_configs = NULL;
+    if (slave->sdo_configs != NULL) {
+        /* R2: each SDO config may own a heap byte-string payload */
+        for (int i = 0; i < slave->sdo_count; i++) {
+            free(slave->sdo_configs[i].value_bytes);
+            slave->sdo_configs[i].value_bytes = NULL;
+            slave->sdo_configs[i].value_bytes_len = 0;
+        }
+        free(slave->sdo_configs);
+        slave->sdo_configs = NULL;
+    }
     slave->sdo_count = 0;
     slave->sdo_capacity = 0;
 

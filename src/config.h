@@ -103,8 +103,17 @@ typedef struct {
 typedef struct {
     char             index[12];        /* hex string e.g. "0x8000" */
     uint8_t          subindex;
-    double           value;            /* stored as double; cast to target type at write time */
+    double           value;            /* numeric payload; valid when value_bytes == NULL */
+    /* R2 (RTOP-319): byte-string payload, used for module InitCmd writes like
+     * 0x80n0:03 = "UR20-4DI-P" that no numeric type can represent. Heap-owned by the SDO
+     * config; freed by ecat_slave_destroy. When non-NULL, the write path uses this instead
+     * of @c value and ignores @c parsed_type (the wire bytes are the content itself). */
+    uint8_t         *value_bytes;
+    size_t           value_bytes_len;
     ecat_data_type_t parsed_type;      /* resolved from data_type string in JSON */
+    /* R2 (RTOP-319): write with ecx_SDOwrite CA=TRUE (one PDU updates every sub-index of
+     * the object). Required for 0xF030 on couplers that advertise CoE CompleteAccess. */
+    bool             complete_access;
     char             name[ECAT_MAX_NAME_LEN];
 } ecat_sdo_config_t;
 

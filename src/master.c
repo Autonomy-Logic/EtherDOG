@@ -19,6 +19,7 @@
 #include "soem/soem.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -367,30 +368,54 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
         /* Parse index from hex string */
         uint16_t index = (uint16_t)strtol(sdo->index, NULL, 16);
 
-        /* parse_sdo rejects UNKNOWN/PAD so encode_sdo_value() returning
-         * 0 here is a parser regression rather than user input -- skip
-         * the SDO defensively rather than crash. */
-        ecat_data_type_t dt = sdo->parsed_type;
-        uint8_t value_buf[8];
-        int size = encode_sdo_value(dt, sdo->value, value_buf);
-        if (size <= 0) {
-            edog_log_error(logger,
-                "Slave %d SDO 0x%04X:%d: unknown data type '%s' -- skipping (parser regression?)",
-                slave_pos, index, sdo->subindex,
-                ecat_data_type_to_string(dt));
-            continue;
-        }
+        /* R2 (RTOP-319): three payload paths. value_bytes != NULL overrides the numeric
+         * encode. complete_access selects the CA=TRUE SDO form (0xF030, multi-sub-index
+         * parameter blocks). Numeric payloads above 8 bytes are rejected by parse_sdo and
+         * therefore cannot reach here. */
+        const uint8_t *wire_buf;
+        int size;
+        uint8_t numeric_buf[8];
 
-        const char *dt_name = ecat_data_type_to_string(dt);
-        if (dt == ECAT_DTYPE_REAL32 || dt == ECAT_DTYPE_REAL64) {
+        if (sdo->value_bytes != NULL && sdo->value_bytes_len > 0) {
+            wire_buf = sdo->value_bytes;
+            if (sdo->value_bytes_len > INT_MAX) {
+                edog_log_error(logger,
+                    "Slave %d SDO 0x%04X:%d: byte payload too large (%zu bytes)",
+                    slave_pos, index, sdo->subindex, sdo->value_bytes_len);
+                continue;
+            }
+            size = (int)sdo->value_bytes_len;
             edog_log_debug(logger,
-                "Slave %d: writing SDO 0x%04X:%d = %g (%s, %d bytes)",
-                slave_pos, index, sdo->subindex, sdo->value, dt_name, size);
+                "Slave %d: writing SDO 0x%04X:%d (byte-string, %d bytes%s)",
+                slave_pos, index, sdo->subindex, size,
+                sdo->complete_access ? ", CA" : "");
         } else {
-            edog_log_debug(logger,
-                "Slave %d: writing SDO 0x%04X:%d = %lld (%s, %d bytes)",
-                slave_pos, index, sdo->subindex, (long long)(int64_t)sdo->value,
-                dt_name, size);
+            /* parse_sdo rejects UNKNOWN/PAD so encode_sdo_value() returning
+             * 0 here is a parser regression rather than user input -- skip
+             * the SDO defensively rather than crash. */
+            ecat_data_type_t dt = sdo->parsed_type;
+            int encoded = encode_sdo_value(dt, sdo->value, numeric_buf);
+            if (encoded <= 0) {
+                edog_log_error(logger,
+                    "Slave %d SDO 0x%04X:%d: unknown data type '%s' -- skipping (parser regression?)",
+                    slave_pos, index, sdo->subindex,
+                    ecat_data_type_to_string(dt));
+                continue;
+            }
+            wire_buf = numeric_buf;
+            size = encoded;
+            const char *dt_name = ecat_data_type_to_string(dt);
+            if (dt == ECAT_DTYPE_REAL32 || dt == ECAT_DTYPE_REAL64) {
+                edog_log_debug(logger,
+                    "Slave %d: writing SDO 0x%04X:%d = %g (%s, %d bytes%s)",
+                    slave_pos, index, sdo->subindex, sdo->value, dt_name, size,
+                    sdo->complete_access ? ", CA" : "");
+            } else {
+                edog_log_debug(logger,
+                    "Slave %d: writing SDO 0x%04X:%d = %lld (%s, %d bytes%s)",
+                    slave_pos, index, sdo->subindex, (long long)(int64_t)sdo->value,
+                    dt_name, size, sdo->complete_access ? ", CA" : "");
+            }
         }
 
         /* Use per-slave SDO timeout if configured, otherwise SOEM default */
@@ -398,7 +423,8 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
 
         int wkc = ecx_SDOwrite(&inst->ecx_context, (uint16)slave_pos,
                                 index, sdo->subindex,
-                                FALSE, size, value_buf, sdo_timeout_us);
+                                sdo->complete_access ? TRUE : FALSE,
+                                size, (void *)wire_buf, sdo_timeout_us);
 
         if (wkc <= 0) {
             edog_log_warn(logger,
