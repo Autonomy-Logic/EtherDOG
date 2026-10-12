@@ -2037,6 +2037,86 @@ static int handle_scan_modules_command(cJSON *root, ecat_reply_t *out)
     return 0;
 }
 
+/*
+ * Per-slave diagnostics for a modular coupler.
+ *
+ * Request: {"command":"diagnostics-slave","params":{"master":<index>,"slave":<pos>}}
+ * Response (success): {"status":"success","master":M,"slave":S,
+ *                      "coupler":{"status_word":N,"poll_at_ms":T},
+ *                      "modules":[{"slot":0,"status_byte":B},...]}
+ * Response (failure): {"status":"error","message":"..."}
+ *
+ * The status_word carries the ETG.5001 device-state flags (bits 6 and 7 are
+ * configuration mismatch and configuration never written); module status bytes
+ * follow the standard mapping (0x00 operational, 0x81 wrong, 0x82 missing, 0x83
+ * configuration mismatch).
+ */
+static int handle_diagnostics_slave_command(cJSON *root, ecat_reply_t *out)
+{
+    cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
+    if (params == NULL || !cJSON_IsObject(params)) {
+        reply_printf(out, "{\"status\":\"error\",\"message\":\"missing 'params'\"}");
+        return -1;
+    }
+    cJSON *mj = cJSON_GetObjectItemCaseSensitive(params, "master");
+    cJSON *sj = cJSON_GetObjectItemCaseSensitive(params, "slave");
+    if (!cJSON_IsNumber(mj) || !cJSON_IsNumber(sj)) {
+        reply_printf(out, "{\"status\":\"error\","
+                          "\"message\":\"'master' and 'slave' must be numbers\"}");
+        return -1;
+    }
+    int master_idx = mj->valueint;
+    int slave_pos = sj->valueint;
+
+    if (master_idx < 0 || master_idx >= g_master_count) {
+        reply_printf(out, "{\"status\":\"error\","
+                          "\"message\":\"master index %d out of range (0..%d)\"}",
+                     master_idx, g_master_count - 1);
+        return -1;
+    }
+
+    /* Same cap as scan-modules: ETG.5001 limits a station to 128 slots. */
+    uint8_t module_status[256];
+    uint16_t status_word = 0;
+    int module_count = 0;
+    char err[160];
+    err[0] = '\0';
+    int rc = ecat_master_read_slave_diagnostics(&g_masters[master_idx], slave_pos,
+                                                 &status_word, module_status,
+                                                 (int)(sizeof(module_status) / sizeof(module_status[0])),
+                                                 &module_count,
+                                                 err, sizeof(err), &g_logger);
+    if (rc != 0) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "status", "error");
+        cJSON_AddStringToObject(resp, "message", err[0] ? err : "diagnostics read failed");
+        reply_json(out, resp);
+        return -1;
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "status", "success");
+    cJSON_AddNumberToObject(resp, "master", master_idx);
+    cJSON_AddNumberToObject(resp, "slave", slave_pos);
+    cJSON *coupler = cJSON_AddObjectToObject(resp, "coupler");
+    cJSON_AddNumberToObject(coupler, "status_word", (double)status_word);
+    /* Timestamp expressed in milliseconds since the Unix epoch so the editor can tell
+     * a stale poll (the diagnostics tab shows the "last polled" age next to the data). */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    double poll_at_ms = (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+    cJSON_AddNumberToObject(coupler, "poll_at_ms", poll_at_ms);
+    cJSON *mods = cJSON_AddArrayToObject(resp, "modules");
+    for (int i = 0; i < module_count; i++) {
+        cJSON *mod = cJSON_CreateObject();
+        cJSON_AddNumberToObject(mod, "slot", i);
+        cJSON_AddNumberToObject(mod, "status_byte", (double)module_status[i]);
+        cJSON_AddItemToArray(mods, mod);
+    }
+    reply_json(out, resp);
+    return 0;
+}
+
 static int bus_command(const char *command_json, ecat_reply_t *out)
 {
     cJSON *root = cJSON_Parse(command_json);
@@ -2074,6 +2154,8 @@ static int bus_command(const char *command_json, ecat_reply_t *out)
         result = handle_layout_command(out);
     } else if (strcmp(name, "scan-modules") == 0) {
         result = handle_scan_modules_command(root, out);
+    } else if (strcmp(name, "diagnostics-slave") == 0) {
+        result = handle_diagnostics_slave_command(root, out);
     } else if (strcmp(name, "open_data") == 0) {
         result = handle_open_data_command(root, out);
     } else if (strcmp(name, "close_data") == 0) {

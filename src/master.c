@@ -662,7 +662,7 @@ int ecat_master_configure(ecat_master_instance_t *inst, edog_logger_t *logger)
     /* Step 4: map process data. A size of 0 means SOEM could not lay out the PDOs. */
     edog_log_info(logger, "Mapping process data...");
 
-    /* RTOP-319 R1: iomap is a heap-allocated buffer sized at ECAT_IOMAP_INITIAL_SIZE; pass
+    /* iomap is a heap-allocated buffer sized from the parsed project at config load; pass
      * the pointer directly rather than taking its address. */
     int io_size = ecx_config_map_group(&inst->ecx_context, inst->iomap, 0);
     if (io_size <= 0) {
@@ -672,8 +672,14 @@ int ecat_master_configure(ecat_master_instance_t *inst, edog_logger_t *logger)
         return -1;
     }
     if ((size_t)io_size > inst->iomap_capacity) {
+        /* Mapping needs more than our project-sized allocation.  Either the bus carries
+         * more PDO bits than the project declared (hardware vs. project mismatch) or our
+         * sizing formula lost bits.  Reallocating here is unsafe: SOEM retains the iomap
+         * pointer internally for every subsequent send/receive, so growing the buffer
+         * after ec_config_map_group returns leaves SOEM pointing at freed memory. */
         edog_log_error(logger,
-            "IOmap overflow: need %d bytes, allocated %zu (raise ECAT_IOMAP_INITIAL_SIZE)",
+            "IOmap mismatch: SOEM mapped %d bytes but the project sized %zu "
+            "(a slave on the bus carries more PDO bits than the project declares)",
             io_size, inst->iomap_capacity);
         return -1;
     }
@@ -1256,5 +1262,98 @@ int ecat_master_scan_modules(ecat_master_instance_t *inst, int slave_pos,
 
     *idents_out_count = n;
     edog_log_info(logger, "scan-modules slave=%d: %d module idents read", slave_pos, n);
+    return 0;
+}
+
+int ecat_master_read_slave_diagnostics(ecat_master_instance_t *inst, int slave_pos,
+                                        uint16_t *status_word_out,
+                                        uint8_t *module_status_out, int max_modules,
+                                        int *module_count_out,
+                                        char *err_msg, size_t err_size,
+                                        edog_logger_t *logger)
+{
+    if (inst == NULL || status_word_out == NULL || module_status_out == NULL
+            || module_count_out == NULL || max_modules <= 0) {
+        if (err_msg && err_size) snprintf(err_msg, err_size, "invalid arguments");
+        return -1;
+    }
+
+    *status_word_out = 0;
+    *module_count_out = 0;
+
+    if (!inst->soem_initialized) {
+        if (err_msg && err_size) snprintf(err_msg, err_size, "master not initialised");
+        return -1;
+    }
+    if (slave_pos < 1 || slave_pos > inst->ecx_context.slavecount) {
+        if (err_msg && err_size)
+            snprintf(err_msg, err_size, "slave position %d out of range (1..%d)",
+                     slave_pos, inst->ecx_context.slavecount);
+        return -1;
+    }
+    if ((inst->ecx_context.slavelist[slave_pos].mbx_proto & 0x04) == 0) {
+        if (err_msg && err_size)
+            snprintf(err_msg, err_size, "slave %d does not support CoE mailbox", slave_pos);
+        return -1;
+    }
+
+    /* Count modules from 0xF050:00 (same source as scan-modules). A slave that has no
+     * 0xF050 is not a modular coupler and has no per-module diagnostics; report that. */
+    uint8_t module_count = 0;
+    int size = (int)sizeof(module_count);
+    int wkc = ecx_SDOread(&inst->ecx_context, (uint16)slave_pos,
+                          0xF050, 0, FALSE, &size, &module_count, EC_TIMEOUTRXM);
+    if (wkc <= 0 || size != (int)sizeof(module_count)) {
+        if (err_msg && err_size)
+            snprintf(err_msg, err_size,
+                     "slave %d: 0xF050:0 read failed (wkc=%d) — not a modular coupler?",
+                     slave_pos, wkc);
+        edog_log_warn(logger,
+                      "diagnostics-slave slave=%d: 0xF050:0 read failed (wkc=%d)",
+                      slave_pos, wkc);
+        return -1;
+    }
+
+    int n = (int)module_count;
+    if (n > max_modules) n = max_modules;
+
+    /* Per-module status byte: ETG.5001 publishes an array at 0xA000, one byte per
+     * module, in slot order starting at sub-index 1. A failure to read any sub-index
+     * is reported as a zero status byte (unknown) for that slot rather than aborting
+     * the whole call, since vendor extensions may skip or move subindices. */
+    for (int i = 1; i <= n; i++) {
+        uint8_t sb = 0;
+        size = (int)sizeof(sb);
+        wkc = ecx_SDOread(&inst->ecx_context, (uint16)slave_pos,
+                          0xA000, (uint8)i, FALSE, &size, &sb, EC_TIMEOUTRXM);
+        if (wkc > 0 && size == (int)sizeof(sb)) {
+            module_status_out[i - 1] = sb;
+        } else {
+            edog_log_warn(logger,
+                          "diagnostics-slave slave=%d: 0xA000:%d read failed (wkc=%d)",
+                          slave_pos, i, wkc);
+            module_status_out[i - 1] = 0;
+        }
+    }
+    *module_count_out = n;
+
+    /* Coupler status word: read 0xA000:00 as a 16-bit value. On most ETG.5001 couplers
+     * sub-index 0 reports the module count (u8), so the high byte is zero and bits 6/7
+     * remain the ETG.5001 configuration-state flags editors decode. A failure here
+     * reports status_word=0 rather than aborting, so the modules list is still useful. */
+    uint16_t sw = 0;
+    size = (int)sizeof(sw);
+    wkc = ecx_SDOread(&inst->ecx_context, (uint16)slave_pos,
+                      0xA000, 0, FALSE, &size, &sw, EC_TIMEOUTRXM);
+    if (wkc > 0 && size == (int)sizeof(sw)) {
+        *status_word_out = sw;
+    } else {
+        /* Already have module_count from the u8 read above; the u16 read may be refused
+         * if the slave only publishes 0xA000:00 as an 8-bit entry. Fall back to the u8. */
+        *status_word_out = (uint16_t)module_count;
+    }
+
+    edog_log_info(logger, "diagnostics-slave slave=%d: status_word=0x%04X, %d modules",
+                  slave_pos, (unsigned)*status_word_out, n);
     return 0;
 }

@@ -272,4 +272,33 @@ int ecat_master_scan_modules(ecat_master_instance_t *inst, int slave_pos,
                              uint32_t *idents_out, int max_idents, int *idents_out_count,
                              char *err_msg, size_t err_size, edog_logger_t *logger);
 
+/**
+ * @brief Read ETG.5001 per-slave diagnostics from a modular coupler.
+ *
+ * Reads the coupler status at 0xA000:00 and per-module status bytes at 0xA000:01..N,
+ * where N is the module count returned by 0xF050:00. The caller sizes the buffer to
+ * at least ETG.5001's cap (128 modules). Returns 0 on success and fills every output.
+ * A slave that doesn't publish 0xA000 returns -1 with an explanatory err_msg; the
+ * caller surfaces that so the editor can tell the operator diagnostics are not
+ * supported on this slave.
+ *
+ * @param inst                   Master instance.
+ * @param slave_pos              Position (1..slave_count).
+ * @param status_word_out        Written: coupler status word (bits 6 and 7 are ETG.5001
+ *                               configuration mismatch and configuration never written).
+ * @param module_status_out      Written: one status byte per module slot in slot order.
+ * @param max_modules            Capacity of @p module_status_out.
+ * @param module_count_out       Written: number of module status bytes returned.
+ * @param err_msg                Written: short error message when the return value is non-zero.
+ * @param err_size               Capacity of @p err_msg.
+ * @param logger                 Diagnostic logger.
+ * @return 0 on success, -1 on error (unreachable slave, SDO abort, diagnostics not supported).
+ */
+int ecat_master_read_slave_diagnostics(ecat_master_instance_t *inst, int slave_pos,
+                                        uint16_t *status_word_out,
+                                        uint8_t *module_status_out, int max_modules,
+                                        int *module_count_out,
+                                        char *err_msg, size_t err_size,
+                                        edog_logger_t *logger);
+
 #endif /* ETHERCAT_MASTER_H */

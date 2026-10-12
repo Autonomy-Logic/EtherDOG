@@ -156,6 +156,44 @@ void test_lifecycle_DestroyIsIdempotentAndNullSafe(void)
     ecat_config_destroy(&cfg);  /* idempotent: safe */
 }
 
+/* The iomap allocation sizes itself from the parsed config. A larger project (more slaves,
+ * more PDO bits) must produce a strictly larger iomap than a small one; a tiny project must
+ * still fall above the hard floor. Re-allocating across loads of different shapes exercises
+ * the alloc_iomap → destroy → alloc_iomap path. */
+void test_lifecycle_IomapIsSizedFromParsedConfig(void)
+{
+    ecat_master_instance_t *g = calloc(ECAT_MAX_MASTERS, sizeof(ecat_master_instance_t));
+    TEST_ASSERT_NOT_NULL(g);
+
+    /* Small project. */
+    write_config(1, 1, 1, 0);
+    int count = 0;
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK,
+        ecat_config_parse_all(TMPFILE, g, ECAT_MAX_MASTERS, &count));
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, ecat_master_instance_alloc_iomap(&g[0]));
+    size_t small_bytes = g[0].iomap_capacity;
+    TEST_ASSERT_TRUE(small_bytes >= ECAT_IOMAP_MIN_BYTES);
+    ecat_master_instance_destroy(&g[0]);
+    TEST_ASSERT_NULL(g[0].iomap);
+    TEST_ASSERT_EQUAL_INT(0, (int)g[0].iomap_capacity);
+
+    /* Larger project. 8 slaves × 4 PDOs/dir × 8 entries/PDO × 8 bits = many bytes. */
+    write_config(8, 4, 8, 0);
+    count = 0;
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK,
+        ecat_config_parse_all(TMPFILE, g, ECAT_MAX_MASTERS, &count));
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, ecat_master_instance_alloc_iomap(&g[0]));
+    size_t big_bytes = g[0].iomap_capacity;
+    TEST_ASSERT_TRUE(big_bytes > small_bytes);
+    /* Expected bytes: 8 slaves × 2 directions × 4 PDOs × 8 entries × 8 bits = 4096 bits →
+     * 512 bytes + 8 × 32 slack = 768.  The capacity must at least cover that. */
+    TEST_ASSERT_TRUE(big_bytes >= 512 + 8 * ECAT_IOMAP_SLACK_PER_SLAVE);
+    ecat_master_instance_destroy(&g[0]);
+    TEST_ASSERT_NULL(g[0].iomap);
+
+    free(g);
+}
+
 /* Confirm a parse failure leaves the config in a destroy-safe state and never leaks the
  * partially populated allocations. The config is "bad" because its first SDO has an
  * unknown data type, which the parser rejects after allocating the SDO buffer. */

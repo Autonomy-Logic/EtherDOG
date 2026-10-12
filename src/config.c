@@ -13,6 +13,7 @@
 #include <ctype.h>
 #include <float.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -281,6 +282,14 @@ ecat_data_type_t ecat_parse_data_type(const char *str)
     if (strcasecmp_local(str, "PAD") == 0)
         return ECAT_DTYPE_PAD;
 
+    /* Byte-string wire types.  No numeric range to check; the bytes travel in
+       ecat_sdo_config_t.value_bytes.  Accepts the CoE names used by ESIs and
+       the generic STRING. */
+    if (strcasecmp_local(str, "VISIBLE_STRING") == 0 ||
+        strcasecmp_local(str, "OCTET_STRING") == 0 ||
+        strcasecmp_local(str, "STRING") == 0)
+        return ECAT_DTYPE_BYTESTRING;
+
     return ECAT_DTYPE_UNKNOWN;
 }
 
@@ -459,7 +468,10 @@ static bool sdo_value_in_range(ecat_data_type_t dt, double v)
     case ECAT_DTYPE_REAL32: return v >= -FLT_MAX && v <= FLT_MAX;
     case ECAT_DTYPE_REAL64: return true;
     case ECAT_DTYPE_UNKNOWN:
-    case ECAT_DTYPE_PAD:    return false;
+    case ECAT_DTYPE_PAD:
+    /* A byte-string SDO never flows through this check — the parser routes it
+       to the value_bytes branch. */
+    case ECAT_DTYPE_BYTESTRING: return false;
     }
     return false;
 }
@@ -506,13 +518,34 @@ static int parse_sdo(const cJSON *sdo_json, ecat_sdo_config_t *sdo)
         return ECAT_CONFIG_ERR_INVALID;
     }
 
-    /* data_type: required, must resolve to a known type (UNKNOWN/PAD reject) */
+    /* data_type: required, must resolve to a known type.  UNKNOWN/PAD reject
+       UNLESS the SDO carries a value_bytes payload — a byte-string write is a
+       raw-byte wire operation whose type name only has to tell us the payload
+       is bytes, so VISIBLE_STRING / OCTET_STRING / STRING are accepted here
+       and any other type is tolerated when value_bytes is present (the
+       numeric range check below is skipped on the value_bytes branch). */
     const char *dtype_str = get_string(sdo_json, "data_type", "");
     sdo->parsed_type = ecat_parse_data_type(dtype_str);
+    const cJSON *vbytes_lookahead = cJSON_GetObjectItemCaseSensitive(sdo_json, "value_bytes");
+    const bool has_value_bytes =
+        cJSON_IsString(vbytes_lookahead) && vbytes_lookahead->valuestring != NULL;
     if (sdo->parsed_type == ECAT_DTYPE_UNKNOWN || sdo->parsed_type == ECAT_DTYPE_PAD) {
+        if (has_value_bytes) {
+            /* Any type name is tolerated on a byte-string write; treat the
+               payload as a byte string regardless of what the editor named it. */
+            sdo->parsed_type = ECAT_DTYPE_BYTESTRING;
+        } else {
+            edog_log_error(g_config_logger,
+                "SDO %s:%d 'data_type' invalid: '%s' "
+                "(use BOOL/INT8/UINT8/INT16/UINT16/INT32/UINT32/INT64/UINT64/REAL/LREAL "
+                "or VISIBLE_STRING/OCTET_STRING with value_bytes)",
+                sdo->index, sdo->subindex, dtype_str);
+            return ECAT_CONFIG_ERR_INVALID;
+        }
+    }
+    if (sdo->parsed_type == ECAT_DTYPE_BYTESTRING && !has_value_bytes) {
         edog_log_error(g_config_logger,
-            "SDO %s:%d 'data_type' invalid: '%s' "
-            "(use BOOL/INT8/UINT8/INT16/UINT16/INT32/UINT32/INT64/UINT64/REAL/LREAL)",
+            "SDO %s:%d data_type '%s' requires a 'value_bytes' payload",
             sdo->index, sdo->subindex, dtype_str);
         return ECAT_CONFIG_ERR_INVALID;
     }
@@ -1142,6 +1175,8 @@ int ecat_data_type_size(ecat_data_type_t dt)
     case ECAT_DTYPE_REAL64:  return 8;
     case ECAT_DTYPE_UNKNOWN: return 0;
     case ECAT_DTYPE_PAD:     return 0;
+    /* Byte-string size is variable and lives on ecat_sdo_config_t.value_bytes_len. */
+    case ECAT_DTYPE_BYTESTRING: return 0;
     }
     return 0;
 }
@@ -1162,6 +1197,7 @@ const char *ecat_data_type_to_string(ecat_data_type_t dt)
     case ECAT_DTYPE_REAL32:  return "REAL32";
     case ECAT_DTYPE_REAL64:  return "REAL64";
     case ECAT_DTYPE_PAD:     return "PAD";
+    case ECAT_DTYPE_BYTESTRING: return "BYTESTRING";
     }
     return "UNKNOWN";
 }
@@ -1265,6 +1301,36 @@ int ecat_layout_init(ecat_layout_t *layout, int capacity)
  * concurrency guards are needed: the allocation ordering is enforced in master.c and
  * the two-consecutive-loads integration test is the gate for the lifecycle.
  */
+/* Compute the iomap bytes a configuration needs by summing every PDO entry's bit length
+ * and adding alignment slack per slave.  Walks the parsed config, so the number is
+ * knowable at allocation time (ecx_config_init populates slave identity but not Obytes
+ * / Ibytes, so we can't ask SOEM yet).  Returns at least ECAT_IOMAP_MIN_BYTES. */
+static size_t compute_iomap_bytes(const ecat_config_t *config)
+{
+    size_t total_bits = 0;
+    size_t slack = 0;
+    if (config == NULL) return ECAT_IOMAP_MIN_BYTES;
+    for (int s = 0; s < config->slave_count; s++) {
+        const ecat_slave_t *slave = &config->slaves[s];
+        for (int p = 0; p < slave->rx_pdo_count; p++) {
+            const ecat_pdo_t *pdo = &slave->rx_pdos[p];
+            for (int e = 0; e < pdo->entry_count; e++) {
+                total_bits += pdo->entries[e].bit_length;
+            }
+        }
+        for (int p = 0; p < slave->tx_pdo_count; p++) {
+            const ecat_pdo_t *pdo = &slave->tx_pdos[p];
+            for (int e = 0; e < pdo->entry_count; e++) {
+                total_bits += pdo->entries[e].bit_length;
+            }
+        }
+        slack += ECAT_IOMAP_SLACK_PER_SLAVE;
+    }
+    size_t bytes = (total_bits + 7) / 8 + slack;
+    if (bytes < ECAT_IOMAP_MIN_BYTES) bytes = ECAT_IOMAP_MIN_BYTES;
+    return bytes;
+}
+
 int ecat_master_instance_alloc_iomap(ecat_master_instance_t *inst)
 {
     if (inst == NULL) return -1;
@@ -1274,18 +1340,15 @@ int ecat_master_instance_alloc_iomap(ecat_master_instance_t *inst)
         return -1;
     }
 
-    /* ecx_config_init populates slave identity but not Ibytes/Obytes -- those come from
-     * ecx_config_map_group, which needs the buffer passed in. We therefore allocate the
-     * initial size here and the caller fails the start if the mapping requires more.
-     * The macro replaces the old struct-embedded ECAT_IOMAP_SIZE; raising it is a
-     * one-constant tune, not a struct-layout change (RTOP-319 R1). */
-    inst->iomap = (uint8_t *)calloc(1, ECAT_IOMAP_INITIAL_SIZE);
+    size_t bytes = compute_iomap_bytes(&inst->config);
+    inst->iomap = (uint8_t *)calloc(1, bytes);
     if (inst->iomap == NULL) {
-        edog_log_error(g_config_logger, "iomap: out of memory allocating %d bytes",
-                       ECAT_IOMAP_INITIAL_SIZE);
+        edog_log_error(g_config_logger,
+            "iomap: out of memory allocating %zu bytes for %d slave(s)",
+            bytes, inst->config.slave_count);
         return -1;
     }
-    inst->iomap_capacity = ECAT_IOMAP_INITIAL_SIZE;
+    inst->iomap_capacity = bytes;
     inst->iomap_used_size = 0;
     return 0;
 }

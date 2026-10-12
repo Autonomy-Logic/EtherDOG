@@ -70,20 +70,25 @@ An SDO:
 { "index": "0x8000", "subindex": 1, "value": 3, "data_type": "UINT16", "name": "Filter" }
 ```
 
-Two optional additions, added in RTOP-319 R2:
+Two optional additions:
 
 - `value_bytes` carries a raw byte-string payload instead of a numeric `value`. It accepts
   a plain string, taken as its UTF-8 bytes (no trailing NUL), or a `"0x..."` hex form
-  decoded to bytes. When present, `value` and the `data_type` range check are not
-  consulted; the payload wire-type is the bytes themselves. Needed for ETG.5001 module
-  `InitCmd` writes like `0x80n0:03 = "UR20-4DI-P"` that no numeric type can represent.
+  decoded to bytes. When present, `value` and the numeric range check are not consulted;
+  the payload wire-type is the bytes themselves. Needed for ETG.5001 module `InitCmd`
+  writes like `0x80n0:03 = "UR20-4DI-P"` that no numeric type can represent.
+
+  `data_type` for a byte-string write is `VISIBLE_STRING`, `OCTET_STRING` or `STRING`.
+  Any other `data_type` paired with a `value_bytes` payload is also accepted and treated
+  as a byte-string write, so a vendor-specific type name does not have to be renamed
+  before upload.
 - `complete_access`: `true` sends the SDO with CoE Complete Access (one PDU updates every
   sub-index of the object). Required for `0xF030` on couplers that advertise
   CompleteAccess. Defaults to `false`.
 
 ```json
 { "index": "0x8010", "subindex": 3, "value_bytes": "UR20-4DI-P",
-  "data_type": "UINT8", "name": "Module name init" }
+  "data_type": "VISIBLE_STRING", "name": "Module name init" }
 ```
 
 ### slaves[].config
@@ -119,10 +124,14 @@ is truncated.
 | SDO configurations per slave | hardware memory | Allocated per project at upload. |
 | Process image per direction | 4096 bytes | EtherCAT frame payload at MTU. |
 
-The iomap is initially allocated at `ECAT_IOMAP_INITIAL_SIZE` = 64 KiB, enough for a
-fully populated UR20 station (64 modules) with alignment slack. A configuration that
-needs more is refused at `ecx_config_map_group`; raising the constant is a one-line
-tune in `src/config.h`.
+The iomap is sized from the parsed project at config load.  Every RxPDO / TxPDO entry's
+`bit_length` is summed, the total is rounded up to bytes, and a per-slave alignment slack
+is added for SOEM's sync-manager padding (see `ECAT_IOMAP_SLACK_PER_SLAVE`).  A floor
+(`ECAT_IOMAP_MIN_BYTES`) ensures the smallest station still receives a usable buffer.
+Allocation failures surface as plain out-of-memory errors; no `#define` tune exists any
+more.  If `ecx_config_map_group` later reports a size the project did not account for
+(hardware carrying more PDO bits than the project declares), the start aborts with a
+mismatch message rather than silently truncating.
 
 Names (masters, slaves, PDOs, entries) longer than 63 characters are shortened to 63.
 

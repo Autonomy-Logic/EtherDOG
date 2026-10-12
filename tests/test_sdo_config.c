@@ -378,3 +378,98 @@ void test_sdo_parse_CompleteAccessDefault_ShouldBeFalse(void)
     ecat_config_destroy(&config);
     cleanup_temp();
 }
+
+/* ---- Byte-string data_type acceptance (C8) ---- */
+
+/* Minimal config letting the test name the data_type explicitly. */
+static int write_sdo_json_with_datatype(const char *data_type, const char *extra_fields)
+{
+    FILE *fp = fopen(TEMP_FILE, "w");
+    if (!fp)
+        return -1;
+    fprintf(fp,
+        "[{\"name\":\"m\",\"protocol\":\"ETHERCAT\",\"config\":{"
+        "\"master\":{\"interface\":\"eth0\",\"cycle_time_us\":1000,\"receive_timeout_us\":2000},"
+        "\"slaves\":[{\"position\":1,\"name\":\"S\",\"type\":\"coupler\","
+        "\"vendor_id\":\"0x2\",\"product_code\":\"0x1\",\"revision\":\"0x1\","
+        "\"sdo_configurations\":[{\"index\":\"0x8010\",\"subindex\":3,"
+        "\"data_type\":\"%s\",%s}],"
+        "\"rx_pdos\":[],\"tx_pdos\":[]}]}}]",
+        data_type, extra_fields);
+    fclose(fp);
+    return 0;
+}
+
+void test_sdo_parse_VisibleStringWithBytes_ShouldParse(void)
+{
+    write_sdo_json_with_datatype("VISIBLE_STRING", "\"value_bytes\":\"UR20-4DI-P\"");
+
+    static ecat_config_t config;
+    int rc = ecat_config_parse(TEMP_FILE, &config);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, rc);
+
+    const ecat_sdo_config_t *sdo = &config.slaves[0].sdo_configs[0];
+    TEST_ASSERT_EQUAL_INT(ECAT_DTYPE_BYTESTRING, sdo->parsed_type);
+    TEST_ASSERT_NOT_NULL(sdo->value_bytes);
+    TEST_ASSERT_EQUAL_INT(10, (int)sdo->value_bytes_len);
+
+    ecat_config_destroy(&config);
+    cleanup_temp();
+}
+
+void test_sdo_parse_OctetStringWithBytes_ShouldParse(void)
+{
+    write_sdo_json_with_datatype("OCTET_STRING", "\"value_bytes\":\"0xDEADBEEF\"");
+
+    static ecat_config_t config;
+    int rc = ecat_config_parse(TEMP_FILE, &config);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, rc);
+
+    const ecat_sdo_config_t *sdo = &config.slaves[0].sdo_configs[0];
+    TEST_ASSERT_EQUAL_INT(ECAT_DTYPE_BYTESTRING, sdo->parsed_type);
+    TEST_ASSERT_EQUAL_INT(4, (int)sdo->value_bytes_len);
+    TEST_ASSERT_EQUAL_HEX8(0xDE, sdo->value_bytes[0]);
+
+    ecat_config_destroy(&config);
+    cleanup_temp();
+}
+
+void test_sdo_parse_StringAliasWithBytes_ShouldParse(void)
+{
+    write_sdo_json_with_datatype("STRING", "\"value_bytes\":\"ok\"");
+
+    static ecat_config_t config;
+    int rc = ecat_config_parse(TEMP_FILE, &config);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, rc);
+    TEST_ASSERT_EQUAL_INT(ECAT_DTYPE_BYTESTRING, config.slaves[0].sdo_configs[0].parsed_type);
+
+    ecat_config_destroy(&config);
+    cleanup_temp();
+}
+
+void test_sdo_parse_VisibleStringWithoutBytes_ShouldReject(void)
+{
+    write_sdo_json_with_datatype("VISIBLE_STRING", "\"value\":42");
+
+    static ecat_config_t config;
+    int rc = ecat_config_parse(TEMP_FILE, &config);
+    TEST_ASSERT_NOT_EQUAL(ECAT_CONFIG_OK, rc);
+
+    cleanup_temp();
+}
+
+void test_sdo_parse_UnknownTypeWithBytes_ShouldAccept(void)
+{
+    /* The editor may send an unfamiliar type name while still carrying a byte-string
+       payload (e.g. a vendor-specific type on a modular coupler).  The parser treats
+       such an SDO as a byte-string write rather than rejecting it. */
+    write_sdo_json_with_datatype("VENDOR_WIDGET", "\"value_bytes\":\"ok\"");
+
+    static ecat_config_t config;
+    int rc = ecat_config_parse(TEMP_FILE, &config);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, rc);
+    TEST_ASSERT_EQUAL_INT(ECAT_DTYPE_BYTESTRING, config.slaves[0].sdo_configs[0].parsed_type);
+
+    ecat_config_destroy(&config);
+    cleanup_temp();
+}

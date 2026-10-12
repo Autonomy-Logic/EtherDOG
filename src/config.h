@@ -55,7 +55,11 @@ typedef enum {
     ECAT_DTYPE_UINT64,
     ECAT_DTYPE_REAL32,
     ECAT_DTYPE_REAL64,
-    ECAT_DTYPE_PAD
+    ECAT_DTYPE_PAD,
+    /* Byte-string wire type (CoE VISIBLE_STRING / OCTET_STRING).  The length and
+       the bytes themselves travel in ecat_sdo_config_t.value_bytes; the SDO's
+       numeric `value` is unused. */
+    ECAT_DTYPE_BYTESTRING
 } ecat_data_type_t;
 
 /* Error codes */
@@ -699,18 +703,23 @@ int ecat_layout_init(ecat_layout_t *layout, int capacity);
 /** Free iomap, slaves_snapshot, config contents and layout. Does not free @p inst itself. */
 void ecat_master_instance_destroy(ecat_master_instance_t *inst);
 
-/*
- * Initial iomap allocation size in bytes. Removes the old fixed ECAT_IOMAP_SIZE macro
- * from the struct layout; the struct now carries a heap pointer and the operator can
- * raise this one constant to accommodate larger stations without touching struct layout
- * or any downstream code. 64 KiB covers a fully populated UR20 station (64 modules) with
- * headroom for alignment and SOEM internals.
- */
-#define ECAT_IOMAP_INITIAL_SIZE  65536
+/* Lower bound on the computed iomap size.  SOEM reserves a handful of bytes for its own
+   per-master book-keeping; the exact count is private, so we keep a small floor rather
+   than ever allocating a zero-byte buffer. */
+#define ECAT_IOMAP_MIN_BYTES    256
 
-/** Allocate inst->iomap at ECAT_IOMAP_INITIAL_SIZE. Call before ecx_config_map_group so the
- *  buffer is available for SOEM to populate. If the mapping returns a size larger than the
- *  capacity, the caller logs and bails. Returns 0 on success, -1 on OOM. */
+/* Per-slave alignment slack. ec_config_map_group pads each slave to a byte boundary and
+   each sync manager to a word boundary.  32 bytes per slave covers up to 4 sync managers
+   per slave plus per-slave book-keeping with headroom to spare -- stations stay well under
+   the host memory any realistic project needs. */
+#define ECAT_IOMAP_SLACK_PER_SLAVE 32
+
+/** Allocate inst->iomap sized from the parsed project configuration.  Walks every slave's
+ *  rx_pdos and tx_pdos, sums the per-entry bit lengths, converts to bytes with alignment
+ *  slack, and allocates exactly that much.  No policy ceiling: when the host cannot grant
+ *  the required amount the allocation fails and the start reports it as OOM.  Returns 0
+ *  on success, -1 on OOM.  Must be called before ecx_config_map_group so the buffer is
+ *  available for SOEM to populate. */
 int ecat_master_instance_alloc_iomap(ecat_master_instance_t *inst);
 
 /** Allocate inst->slaves_snapshot sized for inst->config.slave_count. Must be called before
