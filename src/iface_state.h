@@ -11,6 +11,9 @@
  * values to the state directory so the next start after a crash can revert them.
  *
  * Persistence file:  <state dir>/ecat_iface_<iface>.state
+ *
+ * Also requests promiscuous mode per SOEM socket (Linux), which needs no
+ * persistence: the kernel drops the request when the socket closes.
  */
 
 #ifndef ETHERCAT_IFACE_STATE_H

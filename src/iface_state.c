@@ -19,6 +19,9 @@
  *
  * On non-Linux platforms apply/revert are no-ops; the SOEM raw socket
  * is the only thing that interacts with the NIC there.
+ *
+ * On Linux it also requests promiscuous mode on the SOEM raw socket
+ * (PACKET_MR_PROMISC), which the kernel drops when the socket closes.
  */
 
 #include "iface_state.h"
@@ -30,7 +33,6 @@
 #include <string.h>
 
 #ifdef __linux__
-#include <errno.h>
 #include <net/if.h>
 #include <netpacket/packet.h>
 #include <sys/socket.h>

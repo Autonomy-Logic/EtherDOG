@@ -8,8 +8,8 @@
 find_package(Git REQUIRED)
 
 # Patch SOEM's <source> (relative to SOEM_DIR) with <patch> and build the soem target from
-# the patched copy. <absent> is a string the patched file must no longer contain.
-function(etherdog_patch_soem_source source patch absent)
+# the patched copy. <must_not_contain> is a string the patched file must no longer contain.
+function(etherdog_patch_soem_source source patch must_not_contain)
     set(work_dir ${CMAKE_BINARY_DIR}/soem-patch-work)
     set(out ${CMAKE_BINARY_DIR}/soem-patched/${source})
 
@@ -36,9 +36,9 @@ function(etherdog_patch_soem_source source patch absent)
     endif()
 
     file(READ ${work_dir}/${source} patched)
-    string(FIND "${patched}" "${absent}" absent_pos)
-    if(NOT absent_pos EQUAL -1)
-        message(FATAL_ERROR "EtherDOG - patched ${source} still contains '${absent}'")
+    string(FIND "${patched}" "${must_not_contain}" found_pos)
+    if(NOT found_pos EQUAL -1)
+        message(FATAL_ERROR "EtherDOG - patched ${source} still contains '${must_not_contain}'")
     endif()
 
     get_filename_component(out_dir ${out} DIRECTORY)

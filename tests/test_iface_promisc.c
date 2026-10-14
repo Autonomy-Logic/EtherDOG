@@ -21,13 +21,13 @@
 #ifdef __linux__
 #include <arpa/inet.h>
 #include <linux/capability.h>
+#include <net/if.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 #define LOOPBACK "lo"
-#define FLAG_PROMISC 0x100
 
 static edog_logger_t logger;
 static uint64_t first_log_id;
@@ -67,7 +67,7 @@ static int has_net_admin_effective(void)
     return (data[0].effective & (1u << CAP_NET_ADMIN)) != 0;
 }
 
-static int warnings_since_setup(const char *needle)
+static int count_warnings_since_setup(const char *needle)
 {
     edog_log_entry_t entries[16];
     int n = edog_log_query(first_log_id, EDOG_LOG_WARN, entries, 16);
@@ -82,7 +82,7 @@ static int warnings_since_setup(const char *needle)
 
 static int raw_socket_allowed(void)
 {
-    int fd = socket(PF_PACKET, SOCK_RAW, htons(0x88A4));
+    int fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ECAT));
     if (fd < 0)
         return 0;
     close(fd);
@@ -134,7 +134,7 @@ void test_request_promisc_NullContext_ShouldWarnAndFail(void)
 {
 #ifdef __linux__
     TEST_ASSERT_EQUAL_INT(-1, ecat_iface_request_promisc(NULL, LOOPBACK, &logger));
-    TEST_ASSERT_EQUAL_INT(1, warnings_since_setup("lo: promiscuous mode not requested"));
+    TEST_ASSERT_EQUAL_INT(1, count_warnings_since_setup("lo: promiscuous mode not requested"));
 #else
     TEST_IGNORE_MESSAGE("Linux SOEM port only");
 #endif
@@ -148,7 +148,7 @@ void test_request_promisc_ClosedSocket_ShouldWarnAndFail(void)
     ctx.port.sockhandle = -1;
 
     TEST_ASSERT_EQUAL_INT(-1, ecat_iface_request_promisc(&ctx, LOOPBACK, &logger));
-    TEST_ASSERT_EQUAL_INT(1, warnings_since_setup("lo: promiscuous mode not requested"));
+    TEST_ASSERT_EQUAL_INT(1, count_warnings_since_setup("lo: promiscuous mode not requested"));
 #else
     TEST_IGNORE_MESSAGE("Linux SOEM port only");
 #endif
@@ -161,7 +161,7 @@ void test_request_promisc_NullIface_ShouldWarnAndFail(void)
     TEST_ASSERT_TRUE(udp_socket_ctx(&ctx) >= 0);
 
     TEST_ASSERT_EQUAL_INT(-1, ecat_iface_request_promisc(&ctx, NULL, &logger));
-    TEST_ASSERT_EQUAL_INT(1, warnings_since_setup("(null): promiscuous mode not requested"));
+    TEST_ASSERT_EQUAL_INT(1, count_warnings_since_setup("(null): promiscuous mode not requested"));
     close(ctx.port.sockhandle);
 #else
     TEST_IGNORE_MESSAGE("Linux SOEM port only");
@@ -175,7 +175,7 @@ void test_request_promisc_UnknownIface_ShouldWarnAndFail(void)
     TEST_ASSERT_TRUE(udp_socket_ctx(&ctx) >= 0);
 
     TEST_ASSERT_EQUAL_INT(-1, ecat_iface_request_promisc(&ctx, "nosuchif0", &logger));
-    TEST_ASSERT_EQUAL_INT(1, warnings_since_setup("nosuchif0: promiscuous mode not requested"));
+    TEST_ASSERT_EQUAL_INT(1, count_warnings_since_setup("nosuchif0: promiscuous mode not requested"));
     close(ctx.port.sockhandle);
 #else
     TEST_IGNORE_MESSAGE("Linux SOEM port only");
@@ -192,7 +192,7 @@ void test_request_promisc_RefusedRequest_ShouldWarnWithReason(void)
 
     /* A UDP socket refuses SOL_PACKET options, standing in for any setsockopt failure. */
     TEST_ASSERT_EQUAL_INT(-1, ecat_iface_request_promisc(&ctx, LOOPBACK, &logger));
-    TEST_ASSERT_EQUAL_INT(1, warnings_since_setup("lo: promiscuous mode not enabled"));
+    TEST_ASSERT_EQUAL_INT(1, count_warnings_since_setup("lo: promiscuous mode not enabled"));
     close(ctx.port.sockhandle);
 #else
     TEST_IGNORE_MESSAGE("Linux SOEM port only");
@@ -209,7 +209,7 @@ void test_request_promisc_RawSocket_ShouldEnableUntilClose(void)
     if (!raw_socket_allowed())
         TEST_IGNORE_MESSAGE("needs CAP_NET_RAW");
     TEST_ASSERT_EQUAL_INT(0, read_flags(LOOPBACK, &before));
-    if (before & FLAG_PROMISC)
+    if (before & IFF_PROMISC)
         TEST_IGNORE_MESSAGE("lo is already promiscuous");
 
     ecx_contextt ctx;
@@ -218,11 +218,11 @@ void test_request_promisc_RawSocket_ShouldEnableUntilClose(void)
 
     TEST_ASSERT_EQUAL_INT(0, ecat_iface_request_promisc(&ctx, LOOPBACK, &logger));
     TEST_ASSERT_EQUAL_INT(0, read_flags(LOOPBACK, &during));
-    TEST_ASSERT_TRUE(during & FLAG_PROMISC);
+    TEST_ASSERT_TRUE(during & IFF_PROMISC);
 
     ecx_close(&ctx);
     TEST_ASSERT_EQUAL_INT(0, read_flags(LOOPBACK, &after));
-    TEST_ASSERT_FALSE(after & FLAG_PROMISC);
+    TEST_ASSERT_FALSE(after & IFF_PROMISC);
 #else
     TEST_IGNORE_MESSAGE("Linux SOEM port only");
 #endif
