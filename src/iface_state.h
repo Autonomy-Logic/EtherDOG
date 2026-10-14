@@ -62,6 +62,22 @@ void ecat_iface_state_apply(ecat_iface_state_t *state, const char *iface,
  */
 void ecat_iface_state_revert(ecat_iface_state_t *state, edog_logger_t *logger);
 
+/**
+ * @brief Request promiscuous mode on @p iface for as long as the SOEM socket stays open.
+ *
+ * Uses PACKET_MR_PROMISC on the raw socket of @p ctx. It needs no CAP_NET_ADMIN, and the
+ * kernel drops the request when ecx_close() closes the socket, so nothing is left to
+ * revert. EtherCAT replies are broadcast, so a failure only logs a warning.
+ *
+ * On non-Linux platforms this is a no-op that returns 0.
+ *
+ * @param ctx    SOEM context after a successful ecx_init() on @p iface.
+ * @param iface  Interface name passed to ecx_init().
+ * @param logger Logger.
+ * @return 0 when promiscuous mode was requested, -1 otherwise.
+ */
+int ecat_iface_request_promisc(ecx_contextt *ctx, const char *iface, edog_logger_t *logger);
+
 #ifdef __cplusplus
 }
 #endif

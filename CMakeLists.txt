@@ -109,6 +109,14 @@ endif()
 
 add_subdirectory(${SOEM_DIR} ${CMAKE_CURRENT_BINARY_DIR}/soem)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SoemPatches.cmake)
+    # ecx_setupnic must not need CAP_NET_ADMIN; EtherDOG requests promiscuous mode itself.
+    etherdog_patch_soem_source(oshw/linux/nicdrv.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/patches/soem/0001-linux-nicdrv-do-not-set-interface-flags.patch
+        "SIOCSIFFLAGS, &ifr")
+endif()
+
 # =============================================================================
 # EtherDOG core library (everything but main, so tests can link it)
 # =============================================================================
