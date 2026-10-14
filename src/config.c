@@ -206,14 +206,39 @@ static bool get_bool(const cJSON *obj, const char *key, bool default_val)
 }
 
 /**
- * @brief Convert hex string (e.g. "0x00000002") to uint32_t
+ * @brief Parse "0x"/"#x" followed by 1..8 hex digits, nothing else.
+ * @return 0, or -1 for anything else (empty, no prefix, non-hex characters, too long)
  */
-static uint32_t hex_to_uint32(const char *hex_str)
+static int parse_hex_u32(const char *s, uint32_t *out)
 {
-    if (hex_str == NULL) {
-        return 0;
+    if (s == NULL || !((s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) || (s[0] == '#' && (s[1] == 'x' || s[1] == 'X'))))
+        return -1;
+    const char *d = s + 2;
+    size_t n = strlen(d);
+    if (n == 0 || n > 8)
+        return -1;
+    uint32_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!isxdigit((unsigned char)d[i]))
+            return -1;
+        int c = tolower((unsigned char)d[i]);
+        v = (v << 4) | (uint32_t)(c <= '9' ? c - '0' : c - 'a' + 10);
     }
-    return (uint32_t)strtoul(hex_str, NULL, 16);
+    *out = v;
+    return 0;
+}
+
+/** A required hex field of @p obj; logs and returns -1 when absent or malformed. */
+static int get_hex_u32(const cJSON *obj, const char *key, uint32_t max, const char *where,
+                       uint32_t *out)
+{
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (!cJSON_IsString(v) || parse_hex_u32(v->valuestring, out) != 0 || *out > max) {
+        edog_log_error(g_config_logger, "%s: '%s' must be a hex value up to 0x%X", where, key,
+                       (unsigned)max);
+        return -1;
+    }
+    return 0;
 }
 
 /**
@@ -346,6 +371,12 @@ static int parse_pdo_entry(const cJSON *entry_json, ecat_pdo_entry_t *entry)
     }
 
     safe_strcpy(entry->index, get_string(entry_json, "index", "0x0000"), sizeof(entry->index));
+    uint32_t idx = 0;
+    if (parse_hex_u32(entry->index, &idx) != 0 || idx > 0xFFFF) {
+        edog_log_error(g_config_logger, "PDO entry index '%s' is not a 16-bit hex value",
+                       entry->index);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
     entry->subindex = (uint8_t)get_int(entry_json, "subindex", 0);
     entry->bit_length = (uint8_t)get_int(entry_json, "bit_length", 0);
     safe_strcpy(entry->name, get_string(entry_json, "name", ""), sizeof(entry->name));
@@ -368,6 +399,12 @@ static int parse_pdo(const cJSON *pdo_json, ecat_pdo_t *pdo)
 
     safe_strcpy(pdo->index, get_string(pdo_json, "index", "0x0000"), sizeof(pdo->index));
     safe_strcpy(pdo->name, get_string(pdo_json, "name", ""), sizeof(pdo->name));
+    pdo->fixed = get_bool(pdo_json, "fixed", false);
+    uint32_t idx = 0;
+    if (parse_hex_u32(pdo->index, &idx) != 0 || idx == 0 || idx > 0xFFFF) {
+        edog_log_error(g_config_logger, "PDO index '%s' is not a 16-bit hex value", pdo->index);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
 
     pdo->entries = NULL;
     pdo->entry_count = 0;
@@ -393,9 +430,13 @@ static int parse_pdo(const cJSON *pdo_json, ecat_pdo_t *pdo)
 
     const cJSON *entry_json;
     cJSON_ArrayForEach(entry_json, entries) {
-        if (parse_pdo_entry(entry_json, &pdo->entries[pdo->entry_count]) == ECAT_CONFIG_OK) {
-            pdo->entry_count++;
+        int rc = parse_pdo_entry(entry_json, &pdo->entries[pdo->entry_count]);
+        if (rc != ECAT_CONFIG_OK) {
+            edog_log_error(g_config_logger, "PDO %s: entry %d rejected", pdo->index,
+                           pdo->entry_count + 1);
+            return rc;
         }
+        pdo->entry_count++;
     }
 
     return ECAT_CONFIG_OK;
@@ -434,8 +475,10 @@ static int parse_pdo_array(const cJSON *pdo_array, ecat_pdo_t **pdos_out,
     const cJSON *pdo_json;
     cJSON_ArrayForEach(pdo_json, pdo_array) {
         int rc = parse_pdo(pdo_json, &(*pdos_out)[*pdo_count]);
-        if (rc != ECAT_CONFIG_OK)
+        if (rc != ECAT_CONFIG_OK) {
+            ecat_pdo_destroy(&(*pdos_out)[*pdo_count]);
             return rc;
+        }
         (*pdo_count)++;
     }
 
@@ -550,7 +593,7 @@ static int parse_sdo(const cJSON *sdo_json, ecat_sdo_config_t *sdo)
         return ECAT_CONFIG_ERR_INVALID;
     }
 
-    /* R2: optional "value_bytes" overrides "value" and carries a raw byte string. Two
+    /* Optional "value_bytes" overrides "value" and carries a raw byte string. Two
      * input shapes: a plain string ("UR20-4DI-P") is taken as its UTF-8 bytes, and a
      * "0x..." prefix is parsed as hex pairs. When present, the numeric value and the
      * range check are skipped: the payload wire-type is the bytes themselves. */
@@ -574,9 +617,10 @@ static int parse_sdo(const cJSON *sdo_json, ecat_sdo_config_t *sdo)
             if (buf == NULL) return ECAT_CONFIG_ERR_MEMORY;
             for (size_t k = 0; k < n; k++) {
                 char pair[3] = { s[2 + 2 * k], s[2 + 2 * k + 1], '\0' };
-                char *endp = NULL;
-                long v = strtol(pair, &endp, 16);
-                if (endp != pair + 2 || v < 0 || v > 0xFF) {
+                long v = -1;
+                if (isxdigit((unsigned char)pair[0]) && isxdigit((unsigned char)pair[1]))
+                    v = strtol(pair, NULL, 16);
+                if (v < 0 || v > 0xFF) {
                     free(buf);
                     edog_log_error(g_config_logger,
                         "SDO %s:%d 'value_bytes' non-hex byte at offset %zu",
@@ -610,7 +654,7 @@ static int parse_sdo(const cJSON *sdo_json, ecat_sdo_config_t *sdo)
         }
     }
 
-    /* R2: optional "complete_access" flag defaults false. */
+    /* Optional "complete_access" flag, default false. */
     sdo->complete_access = get_bool(sdo_json, "complete_access", false);
 
     safe_strcpy(sdo->name, get_string(sdo_json, "name", ""), sizeof(sdo->name));
@@ -640,6 +684,131 @@ static int parse_channel(const cJSON *ch_json, ecat_channel_t *channel)
 /**
  * @brief Parse a single slave configuration from JSON
  */
+static int parse_mandatory_pdos(const cJSON *slave_json, ecat_slave_t *slave, const char *where)
+{
+    const cJSON *list = cJSON_GetObjectItemCaseSensitive(slave_json, "mandatory_pdos");
+    if (list == NULL)
+        return ECAT_CONFIG_OK;
+    if (!cJSON_IsArray(list)) {
+        edog_log_error(g_config_logger, "%s: 'mandatory_pdos' must be an array", where);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
+    int n = cJSON_GetArraySize(list);
+    if (n == 0)
+        return ECAT_CONFIG_OK;
+    slave->mandatory_pdos = calloc((size_t)n, sizeof(*slave->mandatory_pdos));
+    if (slave->mandatory_pdos == NULL)
+        return ECAT_CONFIG_ERR_MEMORY;
+    const cJSON *item;
+    cJSON_ArrayForEach(item, list) {
+        uint32_t idx = 0;
+        if (!cJSON_IsString(item) || parse_hex_u32(item->valuestring, &idx) != 0 || idx > 0xFFFF) {
+            edog_log_error(g_config_logger, "%s: 'mandatory_pdos' entries must be hex PDO indices",
+                           where);
+            return ECAT_CONFIG_ERR_INVALID;
+        }
+        snprintf(slave->mandatory_pdos[slave->mandatory_pdo_count++], 12, "0x%04X",
+                 (unsigned)idx);
+    }
+    return ECAT_CONFIG_OK;
+}
+
+static int parse_slot_def(const cJSON *json, ecat_slot_def_t *def, const char *where, int i)
+{
+    def->min_instances = get_int(json, "min_instances", 0);
+    def->max_instances = get_int(json, "max_instances", 0);
+    if (def->min_instances < 0 || def->max_instances < 1 ||
+        def->min_instances > def->max_instances) {
+        edog_log_error(g_config_logger,
+                       "%s: slot definition %d needs 0 <= min_instances <= max_instances, "
+                       "max_instances >= 1", where, i + 1);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
+    const cJSON *classes = cJSON_GetObjectItemCaseSensitive(json, "module_classes");
+    if (cJSON_IsArray(classes) && cJSON_GetArraySize(classes) > 0) {
+        int n = cJSON_GetArraySize(classes);
+        def->classes = calloc((size_t)n, sizeof(*def->classes));
+        if (def->classes == NULL)
+            return ECAT_CONFIG_ERR_MEMORY;
+        const cJSON *c;
+        cJSON_ArrayForEach(c, classes) {
+            if (!cJSON_IsString(c)) {
+                edog_log_error(g_config_logger, "%s: slot definition %d: classes must be strings",
+                               where, i + 1);
+                return ECAT_CONFIG_ERR_INVALID;
+            }
+            safe_strcpy(def->classes[def->class_count++], c->valuestring, ECAT_MAX_NAME_LEN);
+        }
+    }
+    const cJSON *idents = cJSON_GetObjectItemCaseSensitive(json, "module_idents");
+    if (cJSON_IsArray(idents) && cJSON_GetArraySize(idents) > 0) {
+        int n = cJSON_GetArraySize(idents);
+        def->idents = calloc((size_t)n, sizeof(*def->idents));
+        if (def->idents == NULL)
+            return ECAT_CONFIG_ERR_MEMORY;
+        const cJSON *id;
+        cJSON_ArrayForEach(id, idents) {
+            if (!cJSON_IsString(id) || parse_hex_u32(id->valuestring, &def->idents[def->ident_count]) != 0) {
+                edog_log_error(g_config_logger, "%s: slot definition %d: idents must be hex",
+                               where, i + 1);
+                return ECAT_CONFIG_ERR_INVALID;
+            }
+            def->ident_count++;
+        }
+    }
+    return ECAT_CONFIG_OK;
+}
+
+static int parse_modular(const cJSON *json, ecat_modular_t *m, const char *where)
+{
+    if (json == NULL)
+        return ECAT_CONFIG_OK;
+    if (!cJSON_IsObject(json)) {
+        edog_log_error(g_config_logger, "%s: 'modular' must be an object", where);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
+    m->present = true;
+    m->slot_index_increment = get_int(json, "slot_index_increment", 0);
+    if (m->slot_index_increment < 0 || m->slot_index_increment > 0x0FFF) {
+        edog_log_error(g_config_logger, "%s: 'slot_index_increment' must be 0..4095", where);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
+    const cJSON *slots = cJSON_GetObjectItemCaseSensitive(json, "slots");
+    if (cJSON_IsArray(slots) && cJSON_GetArraySize(slots) > 0) {
+        m->slots = calloc((size_t)cJSON_GetArraySize(slots), sizeof(*m->slots));
+        if (m->slots == NULL)
+            return ECAT_CONFIG_ERR_MEMORY;
+        const cJSON *sd;
+        cJSON_ArrayForEach(sd, slots) {
+            /* Counted first so a failed definition is still freed by ecat_slave_destroy */
+            ecat_slot_def_t *def = &m->slots[m->slot_count++];
+            int rc = parse_slot_def(sd, def, where, m->slot_count - 1);
+            if (rc != ECAT_CONFIG_OK)
+                return rc;
+        }
+    }
+    const cJSON *modules = cJSON_GetObjectItemCaseSensitive(json, "modules");
+    if (cJSON_IsArray(modules) && cJSON_GetArraySize(modules) > 0) {
+        m->modules = calloc((size_t)cJSON_GetArraySize(modules), sizeof(*m->modules));
+        if (m->modules == NULL)
+            return ECAT_CONFIG_ERR_MEMORY;
+        const cJSON *mj;
+        cJSON_ArrayForEach(mj, modules) {
+            ecat_module_t *mod = &m->modules[m->module_count];
+            mod->slot = get_int(mj, "slot", 0);
+            char mwhere[ECAT_MAX_NAME_LEN + 64];
+            snprintf(mwhere, sizeof(mwhere), "%s, module %d", where, m->module_count + 1);
+            if (mod->slot < 1 || get_hex_u32(mj, "ident", 0xFFFFFFFFu, mwhere, &mod->ident) != 0) {
+                edog_log_error(g_config_logger, "%s: needs a slot from 1 and a hex ident", mwhere);
+                return ECAT_CONFIG_ERR_INVALID;
+            }
+            safe_strcpy(mod->class_name, get_string(mj, "class", ""), sizeof(mod->class_name));
+            m->module_count++;
+        }
+    }
+    return ECAT_CONFIG_OK;
+}
+
 static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
 {
     if (slave_json == NULL || slave == NULL) {
@@ -652,10 +821,14 @@ static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
     safe_strcpy(slave->name, get_string(slave_json, "name", ""), sizeof(slave->name));
     safe_strcpy(slave->type, get_string(slave_json, "type", "coupler"), sizeof(slave->type));
 
-    /* Convert hex string vendor_id, product_code, revision to uint32_t */
-    slave->vendor_id = hex_to_uint32(get_string(slave_json, "vendor_id", "0x0"));
-    slave->product_code = hex_to_uint32(get_string(slave_json, "product_code", "0x0"));
-    slave->revision = hex_to_uint32(get_string(slave_json, "revision", "0x0"));
+    char where[ECAT_MAX_NAME_LEN + 32];
+    snprintf(where, sizeof(where), "Slave '%s' position %d", slave->name, slave->position);
+    if (get_hex_u32(slave_json, "vendor_id", 0xFFFFFFFFu, where, &slave->vendor_id) != 0 ||
+        get_hex_u32(slave_json, "product_code", 0xFFFFFFFFu, where, &slave->product_code) != 0)
+        return ECAT_CONFIG_ERR_INVALID;
+    if (cJSON_GetObjectItemCaseSensitive(slave_json, "revision") != NULL &&
+        get_hex_u32(slave_json, "revision", 0xFFFFFFFFu, where, &slave->revision) != 0)
+        return ECAT_CONFIG_ERR_INVALID;
 
     /* Parse channels. Allocate sized exactly to the JSON array; the caller invokes
      * ecat_slave_destroy() on error, which releases every pointer we allocated here. */
@@ -727,6 +900,14 @@ static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
             slave->name, slave->position, prc);
         return prc;
     }
+
+    int mrc = parse_mandatory_pdos(slave_json, slave, where);
+    if (mrc != ECAT_CONFIG_OK)
+        return mrc;
+    mrc = parse_modular(cJSON_GetObjectItemCaseSensitive(slave_json, "modular"), &slave->modular,
+                        where);
+    if (mrc != ECAT_CONFIG_OK)
+        return mrc;
 
     /* Parse per-slave configuration (defaults applied if "config" is absent) */
     slave->startup_checks.check_vendor_id = true;
@@ -833,7 +1014,8 @@ static int parse_slaves_section(const cJSON *slaves, ecat_config_t *config)
     cJSON_ArrayForEach(slave_json, slaves) {
         int prc = parse_slave(slave_json, &config->slaves[config->slave_count]);
         if (prc != ECAT_CONFIG_OK) {
-            /* parse_slave already logged the specific reason; propagate. */
+            /* Not yet counted, so ecat_config_destroy would not reach it */
+            ecat_slave_destroy(&config->slaves[config->slave_count]);
             return prc;
         }
         config->slave_count++;
@@ -1050,16 +1232,17 @@ int ecat_config_parse_all(const char *config_path,
         parse_diagnostics_section(cJSON_GetObjectItemCaseSensitive(config_obj, "diagnostics"),
                                   &instances[count].config.diagnostics);
 
-        /* Validate this master's config */
+        /* An invalid master refuses the whole configuration, never a subset */
         int result = ecat_config_validate(&instances[count].config);
-        if (result == ECAT_CONFIG_OK) {
-            count++;
-        } else {
-            edog_log_error(g_config_logger,
-                "skipping entry[%d] '%s' (validation failed, error=%d)",
-                i, name, result);
-            ecat_config_destroy(&instances[count].config);
+        if (result != ECAT_CONFIG_OK) {
+            edog_log_error(g_config_logger, "entry[%d] '%s': configuration refused", i, name);
+            for (int k = 0; k <= count; k++)
+                ecat_config_destroy(&instances[k].config);
+            cJSON_Delete(root);
+            *out_count = 0;
+            return result;
         }
+        count++;
     }
 
     cJSON_Delete(root);
@@ -1090,49 +1273,162 @@ int ecat_config_parse_all(const char *config_path,
     return (count > 0) ? ECAT_CONFIG_OK : ECAT_CONFIG_ERR_MISSING;
 }
 
+static uint32_t pdo_index_value(const char *index)
+{
+    uint32_t v = 0;
+    return parse_hex_u32(index, &v) == 0 ? v : 0;
+}
+
+static bool slot_accepts(const ecat_slot_def_t *def, const ecat_module_t *mod)
+{
+    if (def->class_count == 0 && def->ident_count == 0)
+        return true;
+    for (int i = 0; i < def->ident_count; i++)
+        if (def->idents[i] == mod->ident)
+            return true;
+    if (mod->class_name[0] == '\0')
+        return false;
+    for (int i = 0; i < def->class_count; i++)
+        if (strcmp(def->classes[i], mod->class_name) == 0)
+            return true;
+    return false;
+}
+
+/* Physical slots 1..N fill the slot definitions in order: a definition takes slots until it
+ * reaches max_instances or the next module is one it does not accept (once min_instances is
+ * met). An empty slot counts towards the current definition. */
+static int validate_station(const ecat_slave_t *slave)
+{
+    const ecat_modular_t *m = &slave->modular;
+    if (m->slot_count == 0 && m->module_count == 0)
+        return ECAT_CONFIG_OK;
+    if (!m->present || m->slot_count == 0) {
+        edog_log_error(g_config_logger, "Slave %d ('%s'): modules configured but no slot rules",
+                       slave->position, slave->name);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
+    int last = 0;
+    for (int i = 0; i < m->module_count; i++) {
+        if (m->modules[i].slot <= last) {
+            edog_log_error(g_config_logger,
+                           "Slave %d ('%s'): modules must be listed in rising slot order, one per "
+                           "slot (slot %d after %d)",
+                           slave->position, slave->name, m->modules[i].slot, last);
+            return ECAT_CONFIG_ERR_INVALID;
+        }
+        last = m->modules[i].slot;
+    }
+    int def = 0;
+    int count = 0;
+    int next = 0;
+    for (int slot = 1; slot <= last; slot++) {
+        const ecat_module_t *mod =
+            (next < m->module_count && m->modules[next].slot == slot) ? &m->modules[next++] : NULL;
+        while (def < m->slot_count &&
+               (count >= m->slots[def].max_instances ||
+                (mod != NULL && !slot_accepts(&m->slots[def], mod) &&
+                 count >= m->slots[def].min_instances))) {
+            def++;
+            count = 0;
+        }
+        if (def >= m->slot_count) {
+            edog_log_error(g_config_logger,
+                           "Slave %d ('%s'): slot %d is past what the coupler's slot rules allow",
+                           slave->position, slave->name, slot);
+            return ECAT_CONFIG_ERR_INVALID;
+        }
+        if (mod != NULL && !slot_accepts(&m->slots[def], mod)) {
+            edog_log_error(g_config_logger,
+                           "Slave %d ('%s'): slot definition %d does not accept module 0x%08X "
+                           "(class '%s') in slot %d",
+                           slave->position, slave->name, def + 1, (unsigned)mod->ident,
+                           mod->class_name, slot);
+            return ECAT_CONFIG_ERR_INVALID;
+        }
+        count++;
+    }
+    for (int i = def; i < m->slot_count; i++) {
+        int have = i == def ? count : 0;
+        if (have < m->slots[i].min_instances) {
+            edog_log_error(g_config_logger,
+                           "Slave %d ('%s'): slot definition %d needs at least %d module(s), "
+                           "found %d",
+                           slave->position, slave->name, i + 1, m->slots[i].min_instances, have);
+            return ECAT_CONFIG_ERR_INVALID;
+        }
+    }
+    return ECAT_CONFIG_OK;
+}
+
+static int validate_pdos(const ecat_slave_t *slave)
+{
+    int total = slave->rx_pdo_count + slave->tx_pdo_count;
+    for (int a = 0; a < total; a++) {
+        const ecat_pdo_t *pa = a < slave->rx_pdo_count ? &slave->rx_pdos[a]
+                                                        : &slave->tx_pdos[a - slave->rx_pdo_count];
+        for (int b = a + 1; b < total; b++) {
+            const ecat_pdo_t *pb = b < slave->rx_pdo_count
+                                       ? &slave->rx_pdos[b]
+                                       : &slave->tx_pdos[b - slave->rx_pdo_count];
+            if (pdo_index_value(pa->index) == pdo_index_value(pb->index)) {
+                edog_log_error(g_config_logger, "Slave %d ('%s'): PDO %s is assigned twice",
+                               slave->position, slave->name, pa->index);
+                return ECAT_CONFIG_ERR_INVALID;
+            }
+        }
+    }
+    for (int i = 0; i < slave->mandatory_pdo_count; i++) {
+        uint32_t want = pdo_index_value(slave->mandatory_pdos[i]);
+        bool found = false;
+        for (int a = 0; a < total && !found; a++) {
+            const ecat_pdo_t *p = a < slave->rx_pdo_count ? &slave->rx_pdos[a]
+                                                           : &slave->tx_pdos[a - slave->rx_pdo_count];
+            found = pdo_index_value(p->index) == want;
+        }
+        if (!found) {
+            edog_log_error(g_config_logger,
+                           "Slave %d ('%s'): mandatory PDO %s is not assigned",
+                           slave->position, slave->name, slave->mandatory_pdos[i]);
+            return ECAT_CONFIG_ERR_INVALID;
+        }
+    }
+    return ECAT_CONFIG_OK;
+}
+
 int ecat_config_validate(const ecat_config_t *config)
 {
     if (config == NULL) {
         return ECAT_CONFIG_ERR_INVALID;
     }
-
-    /* Validate master interface is not empty */
     if (config->master.interface[0] == '\0') {
+        edog_log_error(g_config_logger, "master: no network interface");
+        return ECAT_CONFIG_ERR_INVALID;
+    }
+    if (config->master.cycle_time_us < 1 || config->master.receive_timeout_us < 1) {
+        edog_log_error(g_config_logger, "master: cycle and receive times must be positive");
         return ECAT_CONFIG_ERR_INVALID;
     }
 
-    /* Validate cycle time */
-    if (config->master.cycle_time_us < 1) {
-        return ECAT_CONFIG_ERR_INVALID;
-    }
-
-    /* Validate receive timeout */
-    if (config->master.receive_timeout_us < 1) {
-        return ECAT_CONFIG_ERR_INVALID;
-    }
-
-    /* Validate slave positions are positive and unique */
     for (int i = 0; i < config->slave_count; i++) {
         const ecat_slave_t *slave = &config->slaves[i];
-
-        if (slave->position < 1) {
+        if (slave->position < 1 || slave->vendor_id == 0 || slave->product_code == 0) {
+            edog_log_error(g_config_logger,
+                           "Slave '%s': needs a position from 1, a vendor id and a product code",
+                           slave->name);
             return ECAT_CONFIG_ERR_INVALID;
         }
-
-        if (slave->vendor_id == 0) {
-            return ECAT_CONFIG_ERR_INVALID;
-        }
-
-        if (slave->product_code == 0) {
-            return ECAT_CONFIG_ERR_INVALID;
-        }
-
-        /* Check for duplicate positions */
         for (int j = i + 1; j < config->slave_count; j++) {
             if (slave->position == config->slaves[j].position) {
+                edog_log_error(g_config_logger, "Slaves '%s' and '%s' share position %d",
+                               slave->name, config->slaves[j].name, slave->position);
                 return ECAT_CONFIG_ERR_INVALID;
             }
         }
+        int rc = validate_pdos(slave);
+        if (rc == ECAT_CONFIG_OK)
+            rc = validate_station(slave);
+        if (rc != ECAT_CONFIG_OK)
+            return rc;
     }
 
     return ECAT_CONFIG_OK;
@@ -1204,7 +1500,7 @@ const char *ecat_data_type_to_string(ecat_data_type_t dt)
 
 /*
  * =============================================================================
- * Destructors (RTOP-319 R1)
+ * Destructors
  * =============================================================================
  */
 
@@ -1227,7 +1523,7 @@ void ecat_slave_destroy(ecat_slave_t *slave)
     slave->channel_capacity = 0;
 
     if (slave->sdo_configs != NULL) {
-        /* R2: each SDO config may own a heap byte-string payload */
+        /* Each SDO config may own a heap byte-string payload */
         for (int i = 0; i < slave->sdo_count; i++) {
             free(slave->sdo_configs[i].value_bytes);
             slave->sdo_configs[i].value_bytes = NULL;
@@ -1256,6 +1552,19 @@ void ecat_slave_destroy(ecat_slave_t *slave)
     }
     slave->tx_pdo_count = 0;
     slave->tx_pdo_capacity = 0;
+
+    free(slave->mandatory_pdos);
+    slave->mandatory_pdos = NULL;
+    slave->mandatory_pdo_count = 0;
+
+    ecat_modular_t *m = &slave->modular;
+    for (int i = 0; i < m->slot_count; i++) {
+        free(m->slots[i].classes);
+        free(m->slots[i].idents);
+    }
+    free(m->slots);
+    free(m->modules);
+    memset(m, 0, sizeof(*m));
 }
 
 void ecat_config_destroy(ecat_config_t *config)
@@ -1348,6 +1657,22 @@ int ecat_master_instance_alloc_iomap(ecat_master_instance_t *inst)
             bytes, inst->config.slave_count);
         return -1;
     }
+    inst->iomap_capacity = bytes;
+    inst->iomap_used_size = 0;
+    return 0;
+}
+
+int ecat_master_instance_grow_iomap(ecat_master_instance_t *inst, size_t bytes)
+{
+    if (inst == NULL) return -1;
+    if (inst->iomap != NULL && inst->iomap_capacity >= bytes) return 0;
+    uint8_t *grown = (uint8_t *)calloc(1, bytes);
+    if (grown == NULL) {
+        edog_log_error(g_config_logger, "iomap: out of memory allocating %zu bytes", bytes);
+        return -1;
+    }
+    free(inst->iomap);
+    inst->iomap = grown;
     inst->iomap_capacity = bytes;
     inst->iomap_used_size = 0;
     return 0;

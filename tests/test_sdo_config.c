@@ -279,7 +279,7 @@ void test_sdo_parse_StringLargeHex_ShouldParseCorrectly(void)
     cleanup_temp();
 }
 
-/* ---- R2 (RTOP-319): byte-string payload + complete_access ---- */
+/* ---- Byte-string payload + complete_access ---- */
 
 /* Minimal config with a slave and one SDO carrying the given extra JSON fields. */
 static int write_sdo_json_fields(const char *extra_fields)

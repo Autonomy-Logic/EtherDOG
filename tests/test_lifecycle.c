@@ -3,13 +3,10 @@
 
 /**
  * @file test_lifecycle.c
- * @brief RTOP-319 R1 critical gate: two-consecutive-loads integration test.
+ * @brief Two-consecutive-loads lifecycle test for the heap-allocated configuration.
  *
- * Replaces the previous "fixed buffer, bounded size" guarantee with "dynamic allocation,
- * freed cleanly between loads". The regression this test exists to catch is the specific
- * sizeof-regression and stale-pointer failure mode documented in the RTOP-284 Requirements
- * Gathering: an array-to-pointer refactor that silently drops sizeof-based iteration or
- * leaves a dangling pointer after a reload. The test loads two configurations of different
+ * Catches an array-to-pointer refactor that silently drops sizeof-based iteration or leaves a
+ * dangling pointer after a reload. The test loads two configurations of different
  * shapes back-to-back and asserts the second load observes exactly the fields of the second
  * config, with no residue of the first.
  */
@@ -220,4 +217,50 @@ void test_lifecycle_ParseFailureDoesNotLeak(void)
      * now in a destroy-safe state. Double-destroying it must not crash. */
     ecat_master_instance_destroy(&g[0]);
     free(g);
+}
+
+/* The iomap only grows before mapping: a larger request replaces the buffer zeroed, a smaller
+ * one keeps it. */
+void test_lifecycle_GrowIomapOnlyGrows(void)
+{
+    ecat_master_instance_t *inst = calloc(1, sizeof(*inst));
+    TEST_ASSERT_NOT_NULL(inst);
+    TEST_ASSERT_EQUAL_INT(0, ecat_master_instance_grow_iomap(inst, 64));
+    TEST_ASSERT_EQUAL_INT(64, (int)inst->iomap_capacity);
+    inst->iomap[63] = 0xAA;
+    uint8_t *before = inst->iomap;
+    TEST_ASSERT_EQUAL_INT(0, ecat_master_instance_grow_iomap(inst, 32));
+    TEST_ASSERT_EQUAL_PTR(before, inst->iomap);
+    TEST_ASSERT_EQUAL_INT(0, ecat_master_instance_grow_iomap(inst, 100000));
+    TEST_ASSERT_EQUAL_INT(100000, (int)inst->iomap_capacity);
+    TEST_ASSERT_EQUAL_HEX8(0, inst->iomap[63]);
+    ecat_master_instance_destroy(inst);
+    TEST_ASSERT_NULL(inst->iomap);
+    free(inst);
+}
+
+/* Start, stop, start: the per-start buffers are allocated, released and allocated again. */
+void test_lifecycle_SnapshotAndIomapSurviveRepeatedStarts(void)
+{
+    ecat_master_instance_t *inst = calloc(1, sizeof(*inst));
+    TEST_ASSERT_NOT_NULL(inst);
+    write_config(3, 1, 2, 0);
+    int count = 0;
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, ecat_config_parse_all(TMPFILE, inst, 1, &count));
+    for (int start = 0; start < 3; start++) {
+        TEST_ASSERT_EQUAL_INT(0, ecat_master_instance_alloc_iomap(inst));
+        TEST_ASSERT_EQUAL_INT(0, ecat_master_instance_alloc_snapshot(inst));
+        TEST_ASSERT_EQUAL_INT(3, inst->slaves_snapshot_capacity);
+        /* A second allocation without a release is an invariant break, not a leak. */
+        TEST_ASSERT_EQUAL_INT(-1, ecat_master_instance_alloc_snapshot(inst));
+        free(inst->iomap);
+        inst->iomap = NULL;
+        inst->iomap_capacity = 0;
+        free(inst->slaves_snapshot);
+        inst->slaves_snapshot = NULL;
+        inst->slaves_snapshot_capacity = 0;
+    }
+    ecat_master_instance_destroy(inst);
+    free(inst);
+    unlink(TMPFILE);
 }

@@ -28,8 +28,15 @@ void setUp(void)
     memset(g_instances, 0, sizeof(g_instances));
 }
 
+static void destroy_all(void)
+{
+    for (int i = 0; i < ECAT_MAX_MASTERS; i++)
+        ecat_config_destroy(&g_instances[i].config);
+}
+
 void tearDown(void)
 {
+    destroy_all();
     remove(TMPFILE);
 }
 
@@ -225,10 +232,10 @@ void test_parse_all_NonEtherCATEntry_ShouldBeSkipped(void)
  *  Validation rejection inside the loop
  * ===================================================================== */
 
-void test_parse_all_InvalidMasterEntry_ShouldBeSkipped(void)
+void test_parse_all_InvalidMasterEntry_ShouldRefuseTheWholeConfig(void)
 {
-    /* First entry has slave with vendor_id=0 -> validate fails -> skipped.
-     * Second entry is valid -> kept. Overall result: OK with count=1. */
+    /* First entry has a slave with vendor_id=0: the whole configuration is refused, the
+     * valid second master is not started on its own. */
     write_tmpfile(
         "["
         "  {\"name\": \"bad\", \"protocol\": \"ETHERCAT\","
@@ -255,15 +262,14 @@ void test_parse_all_InvalidMasterEntry_ShouldBeSkipped(void)
         "   }}"
         "]");
 
-    int count = 0;
-    int rc = ecat_config_parse_all(TMPFILE, g_instances,
-                                   ECAT_MAX_MASTERS, &count);
-    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, rc);
-    TEST_ASSERT_EQUAL_INT(1, count);
-    TEST_ASSERT_EQUAL_STRING("good", g_instances[0].name);
+    int count = 99;
+    int rc = ecat_config_parse_all(TMPFILE, g_instances, ECAT_MAX_MASTERS, &count);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_ERR_INVALID, rc);
+    TEST_ASSERT_EQUAL_INT(0, count);
+    TEST_ASSERT_NULL(g_instances[0].config.slaves);
 }
 
-void test_parse_all_AllInvalid_ShouldReturnMissing(void)
+void test_parse_all_AllInvalid_ShouldBeRefused(void)
 {
     write_tmpfile(
         "[{"
@@ -277,7 +283,7 @@ void test_parse_all_AllInvalid_ShouldReturnMissing(void)
     int count = 99;
     int rc = ecat_config_parse_all(TMPFILE, g_instances,
                                    ECAT_MAX_MASTERS, &count);
-    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_ERR_MISSING, rc);
+    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_ERR_INVALID, rc);
     TEST_ASSERT_EQUAL_INT(0, count);
 }
 
@@ -379,11 +385,12 @@ static void write_bus(int slaves, int pdos, int entries)
 
 static int parse_tmp(void)
 {
+    destroy_all();
     int count = 0;
     return ecat_config_parse_all(TMPFILE, g_instances, ECAT_MAX_MASTERS, &count);
 }
 
-/* RTOP-319 R1: per-slave and per-master size caps were removed; the parser allocates each
+/* There are no per-slave or per-master size caps; the parser allocates each
  * array exactly to the JSON length. The former "AtEveryLimit" check becomes a station-scale
  * acceptance test, and the three "TooMany" rejection tests no longer apply because there is
  * no struct-level cap to exceed. OOM at parse time is logged and surfaces as

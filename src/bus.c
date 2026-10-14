@@ -22,6 +22,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include <assert.h>
 #include <ctype.h>
 #include <errno.h>
 #include <signal.h>
@@ -60,6 +61,12 @@ static bool master_has_layout(ecat_master_instance_t *inst);
 
 /** Minimum timeout for receive in microseconds */
 #define ECAT_MIN_RECEIVE_TIMEOUT_US 200
+
+/** Longest a control command waits for the acyclic lock held by recovery. */
+#define ECAT_ACYCLIC_WAIT_MS 1000
+
+/** Time budget for one coupler diagnostics read. */
+#define ECAT_DIAG_BUDGET_MS 2000
 
 /*
  * =============================================================================
@@ -150,6 +157,19 @@ static int ecat_mutex_init_pi(pthread_mutex_t *m)
     return rc;
 }
 
+/* Timed acquire of the acyclic lock for the control thread. 0 when held. */
+static int acyclic_lock_timed(ecat_master_instance_t *inst, int wait_ms)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += wait_ms / 1000;
+    until.tv_nsec += (long)(wait_ms % 1000) * 1000000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_nsec -= 1000000000L;
+        until.tv_sec += 1;
+    }
+    return pthread_mutex_timedlock(&inst->acyclic_lock, &until) == 0 ? 0 : -1;
+}
 
 /* g_masters is replaced as a whole by configure, only while every master is stopped. */
 
@@ -173,9 +193,7 @@ static char g_state_dir[256] = EDOG_DEFAULT_STATE_DIR;
  */
 static void publish_slaves_snapshot(ecat_master_instance_t *inst)
 {
-    /* RTOP-319 R1: snapshot buffer is heap-allocated with capacity = config.slave_count
-     * once at master start. If allocation never happened (test fixtures that bypass
-     * master_open_and_scan) or capacity is zero, skip -- there's nothing to publish. */
+    /* Not allocated (fixtures that bypass open_and_scan) or empty: nothing to publish. */
     if (inst->slaves_snapshot == NULL || inst->slaves_snapshot_capacity <= 0)
         return;
 
@@ -195,8 +213,7 @@ static void publish_slaves_snapshot(ecat_master_instance_t *inst)
         ecat_slave_status_t *ss = &local[i];
 
         ss->position = cfg->position;
-        strncpy(ss->name, cfg->name, ECAT_MAX_NAME_LEN - 1);
-        ss->name[ECAT_MAX_NAME_LEN - 1] = '\0';
+        snprintf(ss->name, sizeof(ss->name), "%s", cfg->name);
 
         const ec_slavet *soem = ecat_master_get_slave(inst, cfg->position);
         if (soem) {
@@ -277,7 +294,8 @@ static void log_ecat_error(const ecat_master_instance_t *inst, const ec_errort *
 /**
  * @brief Drain SM1 mailboxes and SOEM's internal error queue.
  *
- * Runs ecx_mbxhandler (CoE emergencies land in SOEM's error list), then pops and logs the errors.
+ * Runs ecx_mbxhandler (CoE emergencies land in SOEM's error list), then pops the errors into
+ * the instance's scratch list and logs them after releasing the acyclic lock.
  * Monitor thread only; no-op when SOEM is not initialized.
  */
 static void drain_mailbox_and_errors(ecat_master_instance_t *inst)
@@ -285,20 +303,18 @@ static void drain_mailbox_and_errors(ecat_master_instance_t *inst)
     if (!inst->soem_initialized)
         return;
 
-    /* EC_MAXELIST is SOEM's queue capacity; we never need more slots. */
-    ec_errort errors[EC_MAXELIST];
     int err_count = 0;
-
-    /* At most 8 mailboxes per pass */
-    /* Runs beside the bus thread: keep SOEM's cyclic mailbox mode off, it reads group mbxstatus */
+    pthread_mutex_lock(&inst->acyclic_lock);
+    /* At most 8 mailboxes per pass. Cyclic mailbox mode stays off: it reads group mbxstatus. */
     ecx_mbxhandler(&inst->ecx_context, 0, 8);
     while (err_count < EC_MAXELIST &&
-           ecx_poperror(&inst->ecx_context, &errors[err_count])) {
+           ecx_poperror(&inst->ecx_context, &inst->monitor_errors[err_count])) {
         err_count++;
     }
+    pthread_mutex_unlock(&inst->acyclic_lock);
 
     for (int i = 0; i < err_count; i++)
-        log_ecat_error(inst, &errors[i]);
+        log_ecat_error(inst, &inst->monitor_errors[i]);
 }
 
 /*
@@ -317,6 +333,7 @@ static void drain_mailbox_and_errors(ecat_master_instance_t *inst)
  */
 static int attempt_recovery(ecat_master_instance_t *inst)
 {
+    pthread_mutex_lock(&inst->acyclic_lock);
     ecat_master_read_states(inst);
 
     int all_ok = 1;
@@ -338,6 +355,7 @@ static int attempt_recovery(ecat_master_instance_t *inst)
                 inst->name, pos, inst->config.slaves[i].name);
         }
     }
+    pthread_mutex_unlock(&inst->acyclic_lock);
 
     if (all_ok) {
         edog_log_info(&g_logger,
@@ -548,6 +566,16 @@ static int start_single_master(ecat_master_instance_t *inst)
         }
     }
 
+    /* Fixed mappings must match what the devices report before anything is mapped. */
+    if (ecat_master_verify_fixed_pdos(inst, &g_logger) != 0) {
+        edog_log_error(&g_logger,
+            "Master '%s': a fixed PDO mapping differs from the device -- aborting startup",
+            inst->name);
+        ecat_master_close(inst, &g_logger);
+        atomic_store(&inst->bus_state, ECAT_STATE_ERROR);
+        return -1;
+    }
+
     /* Map process data and configure DC */
     if (ecat_master_configure(inst, &g_logger) != 0) {
         edog_log_error(&g_logger,
@@ -562,6 +590,15 @@ static int start_single_master(ecat_master_instance_t *inst)
         edog_log_error(&g_logger,
             "Master '%s': process data layout failed -- aborting startup",
             inst->name);
+        ecat_layout_destroy(&inst->layout);
+        ecat_master_close(inst, &g_logger);
+        atomic_store(&inst->bus_state, ECAT_STATE_ERROR);
+        return -1;
+    }
+    char data_err[160];
+    if (ecat_data_alloc_buffers(inst, data_err, sizeof(data_err)) != 0) {
+        edog_log_error(&g_logger, "Master '%s': %s -- aborting startup", inst->name, data_err);
+        ecat_layout_destroy(&inst->layout);
         ecat_master_close(inst, &g_logger);
         atomic_store(&inst->bus_state, ECAT_STATE_ERROR);
         return -1;
@@ -734,9 +771,9 @@ static void stop_single_master(ecat_master_instance_t *inst)
     /* IP-stack isolation revert happens inside ecat_master_close(). */
 
     /* The layout dies with the mapping; a client must reopen its session after a restart.
-     * RTOP-319 R1: layout.entries is heap-owned, so free it before zeroing the rest of
-     * the struct (plain memset would leak the entries buffer). */
+     * Both threads are joined, so the frame buffers can go. */
     ecat_data_close(inst);
+    ecat_data_free_buffers(inst);
     ecat_layout_destroy(&inst->layout);
     atomic_store(&inst->consecutive_wkc_errors, 0);
     atomic_store(&inst->recovery_attempts, 0);
@@ -746,9 +783,8 @@ static void stop_single_master(ecat_master_instance_t *inst)
     ecat_master_close(inst, &g_logger);
     atomic_store(&inst->bus_state, ECAT_STATE_STOPPED);
 
-    /* Bus closed: the old AL states mean nothing. RTOP-319 R1: slaves_snapshot was freed by
-     * ecat_master_close() above. Keep the count reset for status queries that may run
-     * before the next start reallocates the buffer. */
+    /* Bus closed: the old AL states mean nothing. ecat_master_close freed the snapshot; reset
+     * the count for status queries before the next start. */
     pthread_mutex_lock(&inst->slaves_mutex);
     if (inst->slaves_snapshot != NULL && inst->slaves_snapshot_capacity > 0) {
         memset(inst->slaves_snapshot, 0,
@@ -1072,15 +1108,23 @@ bool ecat_bus_any_active(void)
     return false;
 }
 
+static void destroy_instance(ecat_master_instance_t *inst)
+{
+    /* Nothing may be freed while a thread of this master still runs. */
+    assert(!atomic_load(&inst->bus_running));
+#if ECAT_ENABLE_MONITOR_THREAD
+    assert(!atomic_load(&inst->monitor_running));
+#endif
+    ecat_data_destroy(inst);
+    ecat_master_instance_destroy(inst);
+    pthread_mutex_destroy(&inst->acyclic_lock);
+    pthread_mutex_destroy(&inst->slaves_mutex);
+}
+
 static void free_masters(void)
 {
-    for (int i = 0; i < g_master_count; i++) {
-        ecat_master_instance_t *inst = &g_masters[i];
-        ecat_data_destroy(inst);
-        /* RTOP-319 R1: release iomap, slaves_snapshot, config and layout owned heap. */
-        ecat_master_instance_destroy(inst);
-        pthread_mutex_destroy(&inst->slaves_mutex);
-    }
+    for (int i = 0; i < g_master_count; i++)
+        destroy_instance(&g_masters[i]);
     free(g_masters);
     g_masters = NULL;
     g_master_count = 0;
@@ -1090,7 +1134,12 @@ static int init_instance_locks(ecat_master_instance_t *inst)
 {
     if (ecat_mutex_init_pi(&inst->slaves_mutex) != 0)
         return -1;
+    if (ecat_mutex_init_pi(&inst->acyclic_lock) != 0) {
+        pthread_mutex_destroy(&inst->slaves_mutex);
+        return -1;
+    }
     if (ecat_data_init(inst) != 0) {
+        pthread_mutex_destroy(&inst->acyclic_lock);
         pthread_mutex_destroy(&inst->slaves_mutex);
         return -1;
     }
@@ -1128,11 +1177,8 @@ int ecat_bus_configure(const char *path, char *err, size_t err_size)
 
     for (int i = 0; i < count; i++) {
         if (init_instance_locks(&temp[i]) != 0) {
-            for (int j = 0; j < i; j++) {
-                ecat_data_destroy(&temp[j]);
-                ecat_master_instance_destroy(&temp[j]);
-                pthread_mutex_destroy(&temp[j].slaves_mutex);
-            }
+            for (int j = 0; j < i; j++)
+                destroy_instance(&temp[j]);
             /* And release the parsed configs for the instances we never init-locked. */
             for (int j = i; j < count; j++) {
                 ecat_config_destroy(&temp[j].config);
@@ -1576,8 +1622,7 @@ static void add_slaves_json(ecat_master_instance_t *inst, cJSON *master,
 {
     *out_count = 0;
 
-    /* RTOP-319 R1: snapshot buffer is heap-allocated; copy under the mutex into a local
-     * heap buffer sized to the published count, then release the lock before building JSON. */
+    /* Copy under the mutex, then build the JSON without it. */
     pthread_mutex_lock(&inst->slaves_mutex);
     int n = inst->slaves_snapshot_count;
     if (inst->slaves_snapshot == NULL || n <= 0) {
@@ -1974,53 +2019,106 @@ static int handle_close_data_command(ecat_reply_t *out)
     return 0;
 }
 
-/*
- * R3 (RTOP-319): "scan-modules" command for ETG.5001 modular couplers.
- *
- * Request: {"command":"scan-modules","params":{"master":<index>,"slave":<pos>}}
- * Response: {"status":"success","idents":[0xN,0xN,...]} or {"status":"error","message":"..."}
- *
- * Reads 0xF050 on the given slave via ecat_master_scan_modules() and returns the detected
- * module idents in slot order. The caller matches each ident against its ESI repository.
- */
-static int handle_scan_modules_command(cJSON *root, ecat_reply_t *out)
+/* Parses {"master":M,"slave":S}. 0 with both set, or -1 with @p out filled. */
+static int parse_master_slave(cJSON *root, ecat_reply_t *out, int *master_idx, int *slave_pos)
 {
     cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
-    if (params == NULL || !cJSON_IsObject(params)) {
-        reply_printf(out, "{\"status\":\"error\",\"message\":\"missing 'params'\"}");
-        return -1;
-    }
-    cJSON *mj = cJSON_GetObjectItemCaseSensitive(params, "master");
-    cJSON *sj = cJSON_GetObjectItemCaseSensitive(params, "slave");
+    cJSON *mj = params ? cJSON_GetObjectItemCaseSensitive(params, "master") : NULL;
+    cJSON *sj = params ? cJSON_GetObjectItemCaseSensitive(params, "slave") : NULL;
     if (!cJSON_IsNumber(mj) || !cJSON_IsNumber(sj)) {
         reply_printf(out, "{\"status\":\"error\","
                           "\"message\":\"'master' and 'slave' must be numbers\"}");
         return -1;
     }
-    int master_idx = mj->valueint;
-    int slave_pos = sj->valueint;
-
-    if (master_idx < 0 || master_idx >= g_master_count) {
+    if (mj->valuedouble < 0 || mj->valuedouble >= g_master_count ||
+        mj->valuedouble != (double)mj->valueint) {
         reply_printf(out, "{\"status\":\"error\","
-                          "\"message\":\"master index %d out of range (0..%d)\"}",
-                     master_idx, g_master_count - 1);
+                          "\"message\":\"master index out of range (0..%d)\"}",
+                     g_master_count - 1);
         return -1;
     }
-
-    /* Bounded buffer: ETG.5001 caps a station at 128 slots and 256 is twice that. */
-    uint32_t idents[256];
-    int ident_count = 0;
-    char err[160];
-    err[0] = '\0';
-    int rc = ecat_master_scan_modules(&g_masters[master_idx], slave_pos, idents,
-                                      (int)(sizeof(idents) / sizeof(idents[0])),
-                                      &ident_count, err, sizeof(err), &g_logger);
-    if (rc != 0) {
-        cJSON *resp = cJSON_CreateObject();
-        cJSON_AddStringToObject(resp, "status", "error");
-        cJSON_AddStringToObject(resp, "message", err[0] ? err : "scan failed");
-        reply_json(out, resp);
+    if (sj->valuedouble < 1 || sj->valuedouble > 65535 ||
+        sj->valuedouble != (double)sj->valueint) {
+        reply_printf(out, "{\"status\":\"error\","
+                          "\"message\":\"'slave' must be an integer in 1..65535\"}");
         return -1;
+    }
+    *master_idx = mj->valueint;
+    *slave_pos = sj->valueint;
+    return 0;
+}
+
+static int reply_error(ecat_reply_t *out, const char *message)
+{
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "status", "error");
+    cJSON_AddStringToObject(resp, "message", message);
+    reply_json(out, resp);
+    return -1;
+}
+
+/* Another running master owns the raw socket on this interface. */
+static bool interface_in_use(const ecat_master_instance_t *self)
+{
+    for (int i = 0; i < g_master_count; i++) {
+        const ecat_master_instance_t *other = &g_masters[i];
+        if (other != self && other->soem_initialized &&
+            strcmp(other->config.master.interface, self->config.master.interface) == 0)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * "scan-modules": the detected module list (0xF050) of an ETG.5001 coupler.
+ *
+ * Request:  {"command":"scan-modules","params":{"master":M,"slave":S}}
+ * Response: {"status":"success","master":M,"slave":S,"idents":["0x...",...]}, in slot order
+ *           from slot 1, or {"status":"error","message":"..."}.
+ *
+ * A running master reads through its own context under the acyclic lock; a stopped one opens
+ * a temporary context on its configured interface.
+ */
+static int handle_scan_modules_command(cJSON *root, ecat_reply_t *out)
+{
+    int master_idx = 0;
+    int slave_pos = 0;
+    if (parse_master_slave(root, out, &master_idx, &slave_pos) != 0)
+        return -1;
+
+    ecat_master_instance_t *inst = &g_masters[master_idx];
+    int state = atomic_load(&inst->bus_state);
+    uint32_t *idents = NULL;
+    int count = 0;
+    char err[200];
+    err[0] = '\0';
+    int rc;
+
+    if (inst->soem_initialized && atomic_load(&inst->bus_running)) {
+        if (acyclic_lock_timed(inst, ECAT_ACYCLIC_WAIT_MS) != 0)
+            return reply_error(out, "bus recovering, retry");
+        rc = ecat_read_module_idents(&inst->ecx_context, slave_pos, &idents, &count, err,
+                                     sizeof(err), &g_logger);
+        pthread_mutex_unlock(&inst->acyclic_lock);
+    } else if (!inst->soem_initialized &&
+               (state == ECAT_STATE_IDLE || state == ECAT_STATE_STOPPED ||
+                state == ECAT_STATE_ERROR)) {
+        if (interface_in_use(inst))
+            return reply_error(out, "another master is running on this interface");
+        int preop_us = 0;
+        for (int i = 0; i < inst->config.slave_count; i++) {
+            if (inst->config.slaves[i].position == slave_pos)
+                preop_us = inst->config.slaves[i].timeouts.init_to_preop_timeout_ms * 1000;
+        }
+        rc = ecat_scan_modules_offline(inst->config.master.interface, slave_pos, preop_us,
+                                       &idents, &count, err, sizeof(err), &g_logger);
+    } else {
+        return reply_error(out, "master is starting or stopping, retry");
+    }
+
+    if (rc != 0) {
+        free(idents);
+        return reply_error(out, err[0] ? err : "scan failed");
     }
 
     cJSON *resp = cJSON_CreateObject();
@@ -2028,70 +2126,61 @@ static int handle_scan_modules_command(cJSON *root, ecat_reply_t *out)
     cJSON_AddNumberToObject(resp, "master", master_idx);
     cJSON_AddNumberToObject(resp, "slave", slave_pos);
     cJSON *arr = cJSON_AddArrayToObject(resp, "idents");
-    for (int i = 0; i < ident_count; i++) {
+    for (int i = 0; i < count; i++) {
         char buf[12];
         snprintf(buf, sizeof(buf), "0x%08X", (unsigned)idents[i]);
         cJSON_AddItemToArray(arr, cJSON_CreateString(buf));
     }
-    reply_json(out, resp);
-    return 0;
+    free(idents);
+    return reply_json(out, resp);
+}
+
+static const ecat_slave_t *find_modular_slave(const ecat_master_instance_t *inst, int position)
+{
+    for (int i = 0; i < inst->config.slave_count; i++) {
+        const ecat_slave_t *slave = &inst->config.slaves[i];
+        if (slave->position == position && slave->modular.present)
+            return slave;
+    }
+    return NULL;
 }
 
 /*
- * Per-slave diagnostics for a modular coupler.
+ * "diagnostics-slave": status of a running modular coupler and its configured modules.
  *
- * Request: {"command":"diagnostics-slave","params":{"master":<index>,"slave":<pos>}}
- * Response (success): {"status":"success","master":M,"slave":S,
- *                      "coupler":{"status_word":N,"poll_at_ms":T},
- *                      "modules":[{"slot":0,"status_byte":B},...]}
- * Response (failure): {"status":"error","message":"..."}
+ * Request:  {"command":"diagnostics-slave","params":{"master":M,"slave":S}}
+ * Response: {"status":"success","master":M,"slave":S,
+ *            "coupler":{"status_word":N|null,"poll_at_ms":T},
+ *            "modules":[{"slot":1,"ident":"0x...","status_byte":B|null},...]}
  *
- * The status_word carries the ETG.5001 device-state flags (bits 6 and 7 are
- * configuration mismatch and configuration never written); module status bytes
- * follow the standard mapping (0x00 operational, 0x81 wrong, 0x82 missing, 0x83
- * configuration mismatch).
+ * status_word is the 16 status bits of 0xF100; status_byte is sub-index 1 of the module's
+ * 0xA0n0 object. null means it could not be read within the time budget.
  */
 static int handle_diagnostics_slave_command(cJSON *root, ecat_reply_t *out)
 {
-    cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
-    if (params == NULL || !cJSON_IsObject(params)) {
-        reply_printf(out, "{\"status\":\"error\",\"message\":\"missing 'params'\"}");
+    int master_idx = 0;
+    int slave_pos = 0;
+    if (parse_master_slave(root, out, &master_idx, &slave_pos) != 0)
         return -1;
-    }
-    cJSON *mj = cJSON_GetObjectItemCaseSensitive(params, "master");
-    cJSON *sj = cJSON_GetObjectItemCaseSensitive(params, "slave");
-    if (!cJSON_IsNumber(mj) || !cJSON_IsNumber(sj)) {
-        reply_printf(out, "{\"status\":\"error\","
-                          "\"message\":\"'master' and 'slave' must be numbers\"}");
-        return -1;
-    }
-    int master_idx = mj->valueint;
-    int slave_pos = sj->valueint;
 
-    if (master_idx < 0 || master_idx >= g_master_count) {
-        reply_printf(out, "{\"status\":\"error\","
-                          "\"message\":\"master index %d out of range (0..%d)\"}",
-                     master_idx, g_master_count - 1);
-        return -1;
-    }
+    ecat_master_instance_t *inst = &g_masters[master_idx];
+    const ecat_slave_t *slave = find_modular_slave(inst, slave_pos);
+    if (slave == NULL)
+        return reply_error(out, "slave is not a configured modular coupler");
+    if (!inst->soem_initialized || !atomic_load(&inst->bus_running))
+        return reply_error(out, "the bus is not running");
+    if (acyclic_lock_timed(inst, ECAT_ACYCLIC_WAIT_MS) != 0)
+        return reply_error(out, "bus recovering, retry");
 
-    /* Same cap as scan-modules: ETG.5001 limits a station to 128 slots. */
-    uint8_t module_status[256];
-    uint16_t status_word = 0;
-    int module_count = 0;
-    char err[160];
+    ecat_coupler_diag_t diag;
+    char err[200];
     err[0] = '\0';
-    int rc = ecat_master_read_slave_diagnostics(&g_masters[master_idx], slave_pos,
-                                                 &status_word, module_status,
-                                                 (int)(sizeof(module_status) / sizeof(module_status[0])),
-                                                 &module_count,
-                                                 err, sizeof(err), &g_logger);
+    int rc = ecat_master_read_coupler_diagnostics(inst, slave, ECAT_DIAG_BUDGET_MS, &diag, err,
+                                                  sizeof(err), &g_logger);
+    pthread_mutex_unlock(&inst->acyclic_lock);
     if (rc != 0) {
-        cJSON *resp = cJSON_CreateObject();
-        cJSON_AddStringToObject(resp, "status", "error");
-        cJSON_AddStringToObject(resp, "message", err[0] ? err : "diagnostics read failed");
-        reply_json(out, resp);
-        return -1;
+        ecat_coupler_diag_free(&diag);
+        return reply_error(out, err[0] ? err : "diagnostics read failed");
     }
 
     cJSON *resp = cJSON_CreateObject();
@@ -2099,22 +2188,30 @@ static int handle_diagnostics_slave_command(cJSON *root, ecat_reply_t *out)
     cJSON_AddNumberToObject(resp, "master", master_idx);
     cJSON_AddNumberToObject(resp, "slave", slave_pos);
     cJSON *coupler = cJSON_AddObjectToObject(resp, "coupler");
-    cJSON_AddNumberToObject(coupler, "status_word", (double)status_word);
-    /* Timestamp expressed in milliseconds since the Unix epoch so the editor can tell
-     * a stale poll (the diagnostics tab shows the "last polled" age next to the data). */
+    if (diag.status_known)
+        cJSON_AddNumberToObject(coupler, "status_word", (double)diag.status_word);
+    else
+        cJSON_AddNullToObject(coupler, "status_word");
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    double poll_at_ms = (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
-    cJSON_AddNumberToObject(coupler, "poll_at_ms", poll_at_ms);
+    cJSON_AddNumberToObject(coupler, "poll_at_ms",
+                            (double)ts.tv_sec * 1000.0 + (double)(ts.tv_nsec / 1000000));
     cJSON *mods = cJSON_AddArrayToObject(resp, "modules");
-    for (int i = 0; i < module_count; i++) {
+    for (int i = 0; i < diag.module_count; i++) {
+        const ecat_module_diag_t *md = &diag.modules[i];
         cJSON *mod = cJSON_CreateObject();
-        cJSON_AddNumberToObject(mod, "slot", i);
-        cJSON_AddNumberToObject(mod, "status_byte", (double)module_status[i]);
+        char ident[12];
+        snprintf(ident, sizeof(ident), "0x%08X", (unsigned)md->ident);
+        cJSON_AddNumberToObject(mod, "slot", md->slot);
+        cJSON_AddStringToObject(mod, "ident", ident);
+        if (md->known)
+            cJSON_AddNumberToObject(mod, "status_byte", md->status);
+        else
+            cJSON_AddNullToObject(mod, "status_byte");
         cJSON_AddItemToArray(mods, mod);
     }
-    reply_json(out, resp);
-    return 0;
+    ecat_coupler_diag_free(&diag);
+    return reply_json(out, resp);
 }
 
 static int bus_command(const char *command_json, ecat_reply_t *out)

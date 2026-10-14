@@ -26,6 +26,16 @@ int ecat_data_init(ecat_master_instance_t *inst);
 void ecat_data_destroy(ecat_master_instance_t *inst);
 
 /**
+ * @brief Allocate the frame buffers for the current layout. Before the bus thread starts.
+ *
+ * @return 0, or -1 with @p err filled when a region exceeds EDOG_FRAME_MAX_PAYLOAD or on OOM.
+ */
+int ecat_data_alloc_buffers(ecat_master_instance_t *inst, char *err, size_t err_size);
+
+/** Free the frame buffers. Only after the bus thread has been joined. */
+void ecat_data_free_buffers(ecat_master_instance_t *inst);
+
+/**
  * @brief Open a session towards @p client_endpoint ("unix:/path" or "udp:127.0.0.1:port").
  *
  * Replaces any previous session. Fills @p endpoint_out with the address the client must send

@@ -11,6 +11,7 @@
  */
 
 #include "layout.h"
+#include "etherdog_protocol.h"
 #include "master.h"
 
 #include <stdio.h>
@@ -134,13 +135,13 @@ int ecat_layout_build(ecat_master_instance_t *inst, edog_logger_t *logger)
     layout->output_bytes = grp->Obytes;
     layout->input_bytes = grp->Ibytes;
 
-    if (layout->output_bytes > ECAT_MAX_FRAME_PAYLOAD ||
-        layout->input_bytes > ECAT_MAX_FRAME_PAYLOAD) {
+    if (layout->output_bytes > EDOG_FRAME_MAX_PAYLOAD ||
+        layout->input_bytes > EDOG_FRAME_MAX_PAYLOAD) {
         edog_log_error(logger,
                        "Master '%s': process image (out=%u in=%u bytes) exceeds the %d-byte "
                        "frame payload",
                        inst->name, layout->output_bytes, layout->input_bytes,
-                       ECAT_MAX_FRAME_PAYLOAD);
+                       EDOG_FRAME_MAX_PAYLOAD);
         return -1;
     }
 

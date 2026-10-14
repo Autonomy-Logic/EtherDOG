@@ -35,8 +35,12 @@ A token is optional on a unix socket and mandatory on tcp. It is passed on the f
 Any other first request, or a wrong token, gets an error and the connection is closed. `hello` works without a token too, and reports the server:
 
 ```json
-{"status": "success", "name": "EtherDOG", "version": "0.1.0", "protocol": 1}
+{"status": "success", "name": "EtherDOG", "version": "1.0.0", "protocol": 1,
+ "features": ["ethercat.dynamic_alloc", "ethercat.sdo_byte_string", "ethercat.sdo_complete_access",
+              "ethercat.scan_modules", "ethercat.diagnostics_slave"]}
 ```
+
+`features` names what this build supports ([BUSCONFIG.md](BUSCONFIG.md#protocol-capabilities)); clients ignore names they do not know.
 
 ### Lifecycle
 
@@ -90,7 +94,33 @@ Any other first request, or a wrong token, gets an error and the connection is c
 | `list-interfaces` | none | Lists the network adapters. |
 | `status` | none | Per master: state, slaves with their AL state, and cycle metrics (see below). |
 | `diagnostics` | none | `status`, plus timing (including `overruns`, cycles that ended past the next deadline), recovery, the cyclic AL status poll (`al_poll`: `status`, `responding`, `replies`, `misses`, `faults`), data-session counters (`frames_rx`, `frames_tx`, `frames_dropped`, `watchdog_trips`) and a hex snapshot of the process image. |
+| `scan-modules` | `master`, `slave` | The detected module list (`0xF050`) of a modular coupler, in slot order from slot 1. A running master reads it through its own context; a stopped one opens its configured interface for the read, refused while another master runs on that interface. |
+| `diagnostics-slave` | `master`, `slave` | Status of a running modular coupler (`0xF100`) and of each configured module. The slave must have a `modular` section. |
 | `logs` | `min_id`, `level`, `max` | Recent log entries from the in-memory ring, oldest first. The reply includes `next_id`, the value to pass as `min_id` next time. |
+
+`master` is the master index from `configure`; `slave` is the 1-based bus position.
+
+`scan-modules` reply:
+
+```json
+{"status": "success", "master": 0, "slave": 2, "idents": ["0x00091F84", "0x040115C4"]}
+```
+
+`diagnostics-slave` reply:
+
+```json
+{"status": "success", "master": 0, "slave": 2,
+ "coupler": {"status_word": 64, "poll_at_ms": 1760000000000},
+ "modules": [{"slot": 1, "ident": "0x00091F84", "status_byte": 0}, {"slot": 2, "ident": "0x040115C4", "status_byte": null}]}
+```
+
+- `status_word` holds the 16 status bits of `0xF100` (read with Complete Access).
+- `status_byte` is sub-index 1 of the module's object `0xA000 + (slot - 1) * slot_index_increment`.
+- `null` means the value could not be read; the whole read is bounded to about 2 s.
+- Both commands use the mailbox. While the monitor recovers slaves they wait up to 1 s, then
+  reply with the error `bus recovering, retry`.
+
+Errors from both commands are `{"status": "error", "message": "..."}`.
 
 ### Cycle metrics
 
@@ -133,7 +163,7 @@ Flags:
 - `0x01` VALID. On inputs: the bus is OPERATIONAL. On outputs: the payload holds valid outputs. A clear flag asks for the safe state (all outputs zero).
 - `0x02` WKC_OK (inputs only): the working counter matched the expected value this cycle.
 
-The payload is exactly `input_bytes` (inputs) or `output_bytes` (outputs) from `layout`, at most 4096 bytes.
+The payload is exactly `input_bytes` (inputs) or `output_bytes` (outputs) from `layout`, at most 65483 bytes (`EDOG_FRAME_MAX_PAYLOAD`).
 
 `include/etherdog_protocol.h` implements the header encoding and decoding.
 

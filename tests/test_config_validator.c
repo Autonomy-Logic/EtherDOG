@@ -19,7 +19,7 @@ void tearDown(void) {}
 
 /* Helper: a baseline configuration that should always validate as OK.
  *
- * RTOP-319 R1: slaves and nested channel/sdo/pdo arrays are heap-allocated. Each test owns
+ * Slaves and nested channel/sdo/pdo arrays are heap-allocated. Each test owns
  * its config and is responsible for destroying it before re-initialising. The baseline
  * allocates 2 slave slots so the duplicate-position test can populate two.
  */

@@ -251,54 +251,65 @@ size_t ecat_master_get_iomap_size(ecat_master_instance_t *inst);
  */
 int ecat_master_get_slave_count(ecat_master_instance_t *inst);
 
-/*
- * R3 (RTOP-319): scan 0xF050 (detected module list) on an ETG.5001 modular coupler.
+/**
+ * @brief Read the detected module list (0xF050) of an ETG.5001 coupler.
  *
- * 0xF050:0 holds the module count and 0xF050:1..N each hold a UDINT ident in slot order.
- * A slave that does not implement 0xF050 returns an SDO abort; the function then surfaces
- * the SDO error. The output buffer is caller-owned.
+ * 0xF050:0 holds the module count and 0xF050:1..N one UDINT ident each, in slot order
+ * (slot = position in the list + 1). The slave must be in PRE-OP or higher.
  *
- * @param inst              Master instance (SOEM must be initialised).
- * @param slave_pos         1-based slave position.
- * @param idents_out        Caller-owned array of at least @p max_idents uint32_t slots.
- * @param max_idents        Capacity of @p idents_out.
- * @param idents_out_count  Written: number of idents returned.
- * @param err_msg           Written: short error message when the return value is non-zero.
- * @param err_size          Capacity of @p err_msg.
- * @param logger            Diagnostic logger.
- * @return 0 on success, -1 on error (unreachable slave, SDO abort, buffer too small).
+ * @param idents_out Written: heap array the caller frees, NULL on failure.
+ * @return 0, or -1 with @p err filled (not CoE, no 0xF050, SDO abort, OOM).
  */
-int ecat_master_scan_modules(ecat_master_instance_t *inst, int slave_pos,
-                             uint32_t *idents_out, int max_idents, int *idents_out_count,
-                             char *err_msg, size_t err_size, edog_logger_t *logger);
+int ecat_read_module_idents(ecx_contextt *ctx, int slave_pos, uint32_t **idents_out,
+                            int *count_out, char *err, size_t err_size, edog_logger_t *logger);
 
 /**
- * @brief Read ETG.5001 per-slave diagnostics from a modular coupler.
+ * @brief Read 0xF050 with a temporary SOEM context while no master runs on @p ifname.
  *
- * Reads the coupler status at 0xA000:00 and per-module status bytes at 0xA000:01..N,
- * where N is the module count returned by 0xF050:00. The caller sizes the buffer to
- * at least ETG.5001's cap (128 modules). Returns 0 on success and fills every output.
- * A slave that doesn't publish 0xA000 returns -1 with an explanatory err_msg; the
- * caller surfaces that so the editor can tell the operator diagnostics are not
- * supported on this slave.
- *
- * @param inst                   Master instance.
- * @param slave_pos              Position (1..slave_count).
- * @param status_word_out        Written: coupler status word (bits 6 and 7 are ETG.5001
- *                               configuration mismatch and configuration never written).
- * @param module_status_out      Written: one status byte per module slot in slot order.
- * @param max_modules            Capacity of @p module_status_out.
- * @param module_count_out       Written: number of module status bytes returned.
- * @param err_msg                Written: short error message when the return value is non-zero.
- * @param err_size               Capacity of @p err_msg.
- * @param logger                 Diagnostic logger.
- * @return 0 on success, -1 on error (unreachable slave, SDO abort, diagnostics not supported).
+ * Opens the interface, scans, waits for PRE-OP on the slave, reads, requests INIT and closes.
  */
-int ecat_master_read_slave_diagnostics(ecat_master_instance_t *inst, int slave_pos,
-                                        uint16_t *status_word_out,
-                                        uint8_t *module_status_out, int max_modules,
-                                        int *module_count_out,
-                                        char *err_msg, size_t err_size,
-                                        edog_logger_t *logger);
+int ecat_scan_modules_offline(const char *ifname, int slave_pos, int preop_timeout_us,
+                              uint32_t **idents_out, int *count_out, char *err,
+                              size_t err_size, edog_logger_t *logger);
+
+/** State of one configured module. @c known is false when its state could not be read. */
+typedef struct {
+    int      slot;
+    uint32_t ident;
+    bool     known;
+    uint8_t  status;
+} ecat_module_diag_t;
+
+/** Coupler diagnostics. @c status_known is false when 0xF100 could not be read. */
+typedef struct {
+    bool                status_known;
+    uint16_t            status_word;
+    ecat_module_diag_t *modules;        /* heap-owned, one per configured module */
+    int                 module_count;
+} ecat_coupler_diag_t;
+
+/**
+ * @brief Read a running modular coupler's status (0xF100) and its modules' states.
+ *
+ * Module state is 0xA000 + (slot - 1) * slot_index_increment, sub-index 1, for every module of
+ * the configuration. Reads that fail or exceed @p budget_ms leave their value unknown. Caller
+ * holds the master's acyclic lock and frees @p out with ecat_coupler_diag_free.
+ *
+ * @return 0, or -1 with @p err filled when the bus is not running or the slave has no CoE.
+ */
+int ecat_master_read_coupler_diagnostics(ecat_master_instance_t *inst, const ecat_slave_t *slave,
+                                         int budget_ms, ecat_coupler_diag_t *out, char *err,
+                                         size_t err_size, edog_logger_t *logger);
+
+void ecat_coupler_diag_free(ecat_coupler_diag_t *d);
+
+/**
+ * @brief Compare each fixed PDO of a plain CoE slave with the mapping the device reports.
+ *
+ * Runs in PRE-OP before mapping. An unreadable mapping is logged and skipped.
+ *
+ * @return 0, or -1 when a device maps a fixed PDO differently from the configuration.
+ */
+int ecat_master_verify_fixed_pdos(ecat_master_instance_t *inst, edog_logger_t *logger);
 
 #endif /* ETHERCAT_MASTER_H */
