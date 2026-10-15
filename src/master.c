@@ -130,6 +130,14 @@ int ecat_master_validate_topology(ecat_master_instance_t *inst, edog_logger_t *l
     return 0;
 }
 
+void ecat_soem_release_failed_init(ecx_contextt *ctx)
+{
+    /* ecx_init creates the mailbox pool mutex before it opens the NIC; ecx_close would also
+     * close a socket that was never opened. */
+    osal_mutex_destroy(ctx->mbxpool.mbxmutex);
+    ctx->mbxpool.mbxmutex = NULL;
+}
+
 /*
  * =============================================================================
  * Phase 1: Open Interface, Scan Bus, Validate Topology
@@ -161,6 +169,7 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, edog_logger_t *logge
     edog_log_info(logger, "Opening network interface: %s", config->master.interface);
 
     if (!ecx_init(&inst->ecx_context, config->master.interface)) {
+        ecat_soem_release_failed_init(&inst->ecx_context);
 #if defined(__CYGWIN__) || defined(_WIN32)
         edog_log_error(logger,
             "Failed to initialize EtherCAT interface '%s'. "
@@ -1309,6 +1318,7 @@ int ecat_scan_modules_offline(const char *ifname, int slave_pos, int preop_timeo
         return -1;
     }
     if (!ecx_init(ctx, ifname)) {
+        ecat_soem_release_failed_init(ctx);
         snprintf(err, err_size, "failed to open interface '%s'", ifname);
         free(ctx);
         return -1;

@@ -94,7 +94,7 @@ Any other first request, or a wrong token, gets an error and the connection is c
 | `list-interfaces` | none | Lists the network adapters. |
 | `status` | none | Per master: state, slaves with their AL state, and cycle metrics (see below). |
 | `diagnostics` | none | `status`, plus timing (including `overruns`, cycles that ended past the next deadline), recovery, the cyclic AL status poll (`al_poll`: `status`, `responding`, `replies`, `misses`, `faults`), data-session counters (`frames_rx`, `frames_tx`, `frames_dropped`, `watchdog_trips`) and a hex snapshot of the process image. |
-| `scan-modules` | `master`, `slave` | The detected module list (`0xF050`) of a modular coupler, in slot order from slot 1. A running master reads it through its own context; a stopped one opens its configured interface for the read, refused while another master runs on that interface. |
+| `scan-modules` | `master` or `interface`, `slave` | The detected module list (`0xF050`) of a modular coupler, in slot order from slot 1. A running master reads it through its own context; a stopped one opens its configured interface for the read, refused while another master runs on that interface. With `interface` instead of `master` (a bus not configured yet) EtherDOG opens that interface, refused while a running master uses it. |
 | `diagnostics-slave` | `master`, `slave` | Status of a running modular coupler (`0xF100`) and of each configured module. The slave must have a `modular` section. |
 | `logs` | `min_id`, `level`, `max` | Recent log entries from the in-memory ring, oldest first. The reply includes `next_id`, the value to pass as `min_id` next time. |
 

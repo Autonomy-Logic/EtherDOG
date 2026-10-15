@@ -251,6 +251,9 @@ size_t ecat_master_get_iomap_size(ecat_master_instance_t *inst);
  */
 int ecat_master_get_slave_count(ecat_master_instance_t *inst);
 
+/** Release what a failed ecx_init() allocated; the context must not be used afterwards. */
+void ecat_soem_release_failed_init(ecx_contextt *ctx);
+
 /**
  * @brief Read the detected module list (0xF050) of an ETG.5001 coupler.
  *

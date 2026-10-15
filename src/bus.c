@@ -1363,6 +1363,7 @@ static int handle_scan_command(cJSON *root, ecat_reply_t *out)
     memset(&scan_ctx, 0, sizeof(scan_ctx));
 
     if (!ecx_init(&scan_ctx, iface->valuestring)) {
+        ecat_soem_release_failed_init(&scan_ctx);
         reply_printf(out, "{\"error\":\"Failed to open interface '%s'\"}", iface->valuestring);
         return -1;
     }
@@ -1481,6 +1482,7 @@ static int handle_test_command(cJSON *root, ecat_reply_t *out)
     memset(&test_ctx, 0, sizeof(test_ctx));
 
     if (!ecx_init(&test_ctx, iface->valuestring)) {
+        ecat_soem_release_failed_init(&test_ctx);
         reply_printf(out, "{\"error\":\"Failed to open interface '%s'\"}", iface->valuestring);
         return -1;
     }
@@ -2069,18 +2071,76 @@ static bool interface_in_use(const ecat_master_instance_t *self)
     return false;
 }
 
+static int reply_idents(ecat_reply_t *out, cJSON *resp, const uint32_t *idents, int count)
+{
+    cJSON *arr = cJSON_AddArrayToObject(resp, "idents");
+    for (int i = 0; i < count; i++) {
+        char buf[12];
+        snprintf(buf, sizeof(buf), "0x%08X", (unsigned)idents[i]);
+        cJSON_AddItemToArray(arr, cJSON_CreateString(buf));
+    }
+    return reply_json(out, resp);
+}
+
+/* scan-modules on an interface no configured master owns, e.g. a bus not uploaded yet. */
+static int scan_modules_on_interface(cJSON *params, ecat_reply_t *out)
+{
+    cJSON *iface = cJSON_GetObjectItemCaseSensitive(params, "interface");
+    cJSON *sj = cJSON_GetObjectItemCaseSensitive(params, "slave");
+    if (!cJSON_IsString(iface) || validate_interface_name(iface->valuestring, out) != 0) {
+        if (out->text == NULL)
+            reply_printf(out, "{\"status\":\"error\",\"message\":\"'interface' must be a string\"}");
+        return -1;
+    }
+    if (!cJSON_IsNumber(sj) || sj->valuedouble < 1 || sj->valuedouble > 65535 ||
+        sj->valuedouble != (double)sj->valueint) {
+        reply_printf(out, "{\"status\":\"error\","
+                          "\"message\":\"'slave' must be an integer in 1..65535\"}");
+        return -1;
+    }
+    for (int i = 0; i < g_master_count; i++) {
+        const ecat_master_instance_t *other = &g_masters[i];
+        if (other->soem_initialized && strcmp(other->config.master.interface, iface->valuestring) == 0)
+            return reply_error(out, "a running master uses this interface; stop the PLC to scan");
+    }
+
+    uint32_t *idents = NULL;
+    int count = 0;
+    char err[200];
+    err[0] = '\0';
+    if (ecat_scan_modules_offline(iface->valuestring, sj->valueint, 0, &idents, &count, err,
+                                  sizeof(err), &g_logger) != 0) {
+        free(idents);
+        return reply_error(out, err[0] ? err : "scan failed");
+    }
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "status", "success");
+    cJSON_AddStringToObject(resp, "interface", iface->valuestring);
+    cJSON_AddNumberToObject(resp, "slave", sj->valueint);
+    int rc = reply_idents(out, resp, idents, count);
+    free(idents);
+    return rc;
+}
+
 /*
  * "scan-modules": the detected module list (0xF050) of an ETG.5001 coupler.
  *
  * Request:  {"command":"scan-modules","params":{"master":M,"slave":S}}
+ *       or  {"command":"scan-modules","params":{"interface":"eth0","slave":S}}
  * Response: {"status":"success","master":M,"slave":S,"idents":["0x...",...]}, in slot order
- *           from slot 1, or {"status":"error","message":"..."}.
+ *           from slot 1 ("interface" instead of "master" for the second form), or
+ *           {"status":"error","message":"..."}.
  *
- * A running master reads through its own context under the acyclic lock; a stopped one opens
- * a temporary context on its configured interface.
+ * A running master reads through its own context under the acyclic lock; a stopped one, or an
+ * interface no configured master owns, gets a temporary context.
  */
 static int handle_scan_modules_command(cJSON *root, ecat_reply_t *out)
 {
+    cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
+    if (params != NULL && cJSON_GetObjectItemCaseSensitive(params, "master") == NULL &&
+        cJSON_GetObjectItemCaseSensitive(params, "interface") != NULL)
+        return scan_modules_on_interface(params, out);
+
     int master_idx = 0;
     int slave_pos = 0;
     if (parse_master_slave(root, out, &master_idx, &slave_pos) != 0)
@@ -2125,14 +2185,9 @@ static int handle_scan_modules_command(cJSON *root, ecat_reply_t *out)
     cJSON_AddStringToObject(resp, "status", "success");
     cJSON_AddNumberToObject(resp, "master", master_idx);
     cJSON_AddNumberToObject(resp, "slave", slave_pos);
-    cJSON *arr = cJSON_AddArrayToObject(resp, "idents");
-    for (int i = 0; i < count; i++) {
-        char buf[12];
-        snprintf(buf, sizeof(buf), "0x%08X", (unsigned)idents[i]);
-        cJSON_AddItemToArray(arr, cJSON_CreateString(buf));
-    }
+    rc = reply_idents(out, resp, idents, count);
     free(idents);
-    return reply_json(out, resp);
+    return rc;
 }
 
 static const ecat_slave_t *find_modular_slave(const ecat_master_instance_t *inst, int position)
