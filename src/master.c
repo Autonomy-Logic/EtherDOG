@@ -169,6 +169,7 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, edog_logger_t *logge
 
     inst->soem_initialized = 1;
     edog_log_info(logger, "Network interface opened successfully");
+    ecat_iface_request_promisc(&inst->ecx_context, config->master.interface, logger);
 
     /* Enable SO_BUSY_POLL on the SOEM raw socket.
      * This makes recvfrom() spin-poll the NIC driver instead of sleeping,

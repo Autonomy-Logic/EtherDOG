@@ -19,6 +19,9 @@
  *
  * On non-Linux platforms apply/revert are no-ops; the SOEM raw socket
  * is the only thing that interacts with the NIC there.
+ *
+ * On Linux it also requests promiscuous mode on the SOEM raw socket
+ * (PACKET_MR_PROMISC), which the kernel drops when the socket closes.
  */
 
 #include "iface_state.h"
@@ -28,6 +31,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef __linux__
+#include <net/if.h>
+#include <netpacket/packet.h>
+#include <sys/socket.h>
+#endif
 
 #if !defined(__CYGWIN__) && !defined(_WIN32)
 
@@ -400,6 +409,52 @@ void ecat_iface_state_revert(ecat_iface_state_t *state, edog_logger_t *logger)
 {
     (void)state;
     (void)logger;
+}
+
+#endif
+
+#ifdef __linux__
+
+int ecat_iface_request_promisc(ecx_contextt *ctx, const char *iface, edog_logger_t *logger)
+{
+    const char *name = iface ? iface : "(null)";
+    int sockfd = ctx ? ctx->port.sockhandle : -1;
+    struct packet_mreq mreq;
+
+    if (sockfd < 0 || !iface) {
+        edog_log_warn(logger, "%s: promiscuous mode not requested (no socket or interface)", name);
+        return -1;
+    }
+
+    unsigned int ifindex = if_nametoindex(iface);
+    if (ifindex == 0) {
+        edog_log_warn(logger, "%s: promiscuous mode not requested (interface lookup failed: %s)",
+            name, strerror(errno));
+        return -1;
+    }
+
+    memset(&mreq, 0, sizeof(mreq));
+    mreq.mr_ifindex = (int)ifindex;
+    mreq.mr_type = PACKET_MR_PROMISC;
+    if (setsockopt(sockfd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) != 0) {
+        edog_log_warn(logger,
+            "%s: promiscuous mode not enabled (%s); EtherCAT replies are broadcast, continuing",
+            name, strerror(errno));
+        return -1;
+    }
+
+    edog_log_debug(logger, "%s: promiscuous mode requested for the EtherCAT socket", name);
+    return 0;
+}
+
+#else
+
+int ecat_iface_request_promisc(ecx_contextt *ctx, const char *iface, edog_logger_t *logger)
+{
+    (void)ctx;
+    (void)iface;
+    (void)logger;
+    return 0;
 }
 
 #endif
