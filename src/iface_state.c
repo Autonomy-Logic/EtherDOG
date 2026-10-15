@@ -419,12 +419,17 @@ int ecat_iface_request_promisc(ecx_contextt *ctx, const char *iface, edog_logger
 {
     const char *name = iface ? iface : "(null)";
     int sockfd = ctx ? ctx->port.sockhandle : -1;
-    unsigned int ifindex = 0;
     struct packet_mreq mreq;
 
-    if (sockfd < 0 || !iface || (ifindex = if_nametoindex(iface)) == 0) {
-        edog_log_warn(logger,
-            "%s: promiscuous mode not requested (no socket or unknown interface)", name);
+    if (sockfd < 0 || !iface) {
+        edog_log_warn(logger, "%s: promiscuous mode not requested (no socket or interface)", name);
+        return -1;
+    }
+
+    unsigned int ifindex = if_nametoindex(iface);
+    if (ifindex == 0) {
+        edog_log_warn(logger, "%s: promiscuous mode not requested (interface lookup failed: %s)",
+            name, strerror(errno));
         return -1;
     }
 

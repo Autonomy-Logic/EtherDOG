@@ -175,7 +175,8 @@ void test_request_promisc_UnknownIface_ShouldWarnAndFail(void)
     TEST_ASSERT_TRUE(udp_socket_ctx(&ctx) >= 0);
 
     TEST_ASSERT_EQUAL_INT(-1, ecat_iface_request_promisc(&ctx, "nosuchif0", &logger));
-    TEST_ASSERT_EQUAL_INT(1, count_warnings_since_setup("nosuchif0: promiscuous mode not requested"));
+    TEST_ASSERT_EQUAL_INT(1, count_warnings_since_setup(
+        "nosuchif0: promiscuous mode not requested (interface lookup failed"));
     close(ctx.port.sockhandle);
 #else
     TEST_IGNORE_MESSAGE("Linux SOEM port only");
