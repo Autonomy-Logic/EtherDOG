@@ -43,7 +43,9 @@ sudo ./build/etherdog --config examples/ek1818_busconfig.json --start
 | `--log-level <level>` | `info` |
 | `--log-socket <spec>` | none |
 
-Raw Ethernet access and real-time scheduling need root, or `CAP_NET_RAW`, `CAP_NET_ADMIN` and `CAP_SYS_NICE`.
+Raw Ethernet access and real-time scheduling need root, or `CAP_NET_RAW` and `CAP_SYS_NICE`. `CAP_NET_ADMIN` is optional: without it the NIC tuning (ethtool coalescing and offloads) is skipped. Promiscuous mode is requested per socket and needs no extra capability.
+
+On Linux the build applies the patches in `patches/soem/` to a copy of the SOEM sources in the build directory; the `libs/soem` submodule is not modified. Configuration fails if a patch no longer applies to the pinned SOEM commit.
 
 ## Talking to it
 

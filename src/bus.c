@@ -1375,6 +1375,7 @@ static int handle_scan_command(cJSON *root, ecat_reply_t *out)
         reply_printf(out, "{\"error\":\"Failed to open interface '%s'\"}", iface->valuestring);
         return -1;
     }
+    ecat_iface_request_promisc(&scan_ctx, iface->valuestring, &g_logger);
 
     int slave_count = ecx_config_init(&scan_ctx);
     if (slave_count <= 0) {
@@ -1494,6 +1495,7 @@ static int handle_test_command(cJSON *root, ecat_reply_t *out)
         reply_printf(out, "{\"error\":\"Failed to open interface '%s'\"}", iface->valuestring);
         return -1;
     }
+    ecat_iface_request_promisc(&test_ctx, iface->valuestring, &g_logger);
 
     int slave_count = ecx_config_init(&test_ctx);
     if (slave_count <= 0) {
