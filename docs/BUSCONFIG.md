@@ -79,16 +79,16 @@ An SDO:
 
 Two optional additions:
 
-- `value_bytes` carries a raw byte-string payload instead of a numeric `value`. It accepts
-  a plain string, taken as its UTF-8 bytes (no trailing NUL), or a `"0x..."` hex form
-  decoded to bytes. When present, `value` and the numeric range check are not consulted;
-  the payload wire-type is the bytes themselves. Needed for ETG.5001 module `InitCmd`
-  writes like `0x80n0:03 = "UR20-4DI-P"` that no numeric type can represent.
+- `value_bytes` carries a raw byte-string payload instead of a numeric `value`. A string
+  that starts with `0x` (or `0X`) is always decoded as hex pairs and must have an even,
+  non-zero number of hex digits; any other string is taken as its UTF-8 bytes (no trailing
+  NUL). A text payload that itself begins with `0x` therefore has to be sent in hex form.
+  When present, `value` and the numeric range check are not consulted. Needed for ETG.5001
+  module `InitCmd` writes like `0x80n0:03 = "UR20-4DI-P"` that no numeric type can represent.
 
-  `data_type` for a byte-string write is `VISIBLE_STRING`, `OCTET_STRING` or `STRING`.
-  Any other `data_type` paired with a `value_bytes` payload is also accepted and treated
-  as a byte-string write, so a vendor-specific type name does not have to be renamed
-  before upload.
+  `data_type` for a byte-string write must be `VISIBLE_STRING`, `OCTET_STRING` or `STRING`;
+  any other `data_type` with `value_bytes`, and any of these three without it, is refused at
+  load.
 - `complete_access`: `true` sends the SDO with CoE Complete Access (one PDU updates every
   sub-index of the object). Required for `0xF030` on couplers that advertise
   CompleteAccess. Defaults to `false`.

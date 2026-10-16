@@ -1360,6 +1360,28 @@ static int budget_timeout_us(uint64_t deadline_ms)
     return left_us < (uint64_t)EC_TIMEOUTRXM ? (int)left_us : EC_TIMEOUTRXM;
 }
 
+/* Acyclic lock within the remaining budget; true when held and the bus is still up. */
+static bool lock_for_sdo(ecat_master_instance_t *inst, uint64_t deadline_ms, int pos)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    uint64_t now = monotonic_ms();
+    uint64_t wait_ms = deadline_ms > now ? deadline_ms - now : 0;
+    until.tv_sec += (time_t)(wait_ms / 1000u);
+    until.tv_nsec += (long)(wait_ms % 1000u) * 1000000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_nsec -= 1000000000L;
+        until.tv_sec += 1;
+    }
+    if (pthread_mutex_timedlock(&inst->acyclic_lock, &until) != 0)
+        return false;
+    if (!inst->soem_initialized || pos > inst->ecx_context.slavecount) {
+        pthread_mutex_unlock(&inst->acyclic_lock);
+        return false;
+    }
+    return true;
+}
+
 void ecat_coupler_diag_free(ecat_coupler_diag_t *d)
 {
     if (d == NULL)
@@ -1376,11 +1398,14 @@ int ecat_master_read_coupler_diagnostics(ecat_master_instance_t *inst, const eca
     memset(out, 0, sizeof(*out));
     ecx_contextt *ctx = &inst->ecx_context;
     int pos = slave->position;
-    if (!inst->soem_initialized) {
-        snprintf(err, err_size, "the bus is not running");
+    uint64_t deadline = monotonic_ms() + (uint64_t)(budget_ms > 0 ? budget_ms : 1);
+    if (pos < 1 || !lock_for_sdo(inst, deadline, pos)) {
+        snprintf(err, err_size, "the bus is not running or is recovering, retry");
         return -1;
     }
-    if (pos < 1 || pos > ctx->slavecount || !slave_has_coe(ctx, pos)) {
+    bool has_coe = slave_has_coe(ctx, pos);
+    pthread_mutex_unlock(&inst->acyclic_lock);
+    if (!has_coe) {
         snprintf(err, err_size, "slave %d is not reachable over CoE", pos);
         return -1;
     }
@@ -1398,13 +1423,17 @@ int ecat_master_read_coupler_diagnostics(ecat_master_instance_t *inst, const eca
         out->modules[i].ident = m->modules[i].ident;
     }
 
-    uint64_t deadline = monotonic_ms() + (uint64_t)(budget_ms > 0 ? budget_ms : 1);
-
     /* 0xF100 by Complete Access: SI0 padded to 16 bits, then the status bits. */
     uint8_t buf[64];
     int size = (int)sizeof(buf);
-    int t = budget_timeout_us(deadline);
-    int wkc = t > 0 ? ecx_SDOread(ctx, (uint16)pos, 0xF100, 0, TRUE, &size, buf, t) : 0;
+    int wkc = 0;
+    int t = 0;
+    if (lock_for_sdo(inst, deadline, pos)) {
+        t = budget_timeout_us(deadline);
+        if (t > 0)
+            wkc = ecx_SDOread(ctx, (uint16)pos, 0xF100, 0, TRUE, &size, buf, t);
+        pthread_mutex_unlock(&inst->acyclic_lock);
+    }
     if (wkc > 0 && size >= 4) {
         out->status_known = true;
         out->status_word = (uint16_t)(buf[2] | (buf[3] << 8));
@@ -1417,13 +1446,16 @@ int ecat_master_read_coupler_diagnostics(ecat_master_instance_t *inst, const eca
     for (int i = 0; i < out->module_count; i++) {
         ecat_module_diag_t *md = &out->modules[i];
         long index = 0xA000L + (long)(md->slot - 1) * incr;
-        t = budget_timeout_us(deadline);
         /* Without an increment every module would read slot 1's object. */
-        if (t == 0 || incr <= 0 || index > 0xAFFF)
+        if (incr <= 0 || index > 0xAFFF || !lock_for_sdo(inst, deadline, pos))
             continue;
         uint8_t state[4] = { 0 };
         size = (int)sizeof(state);
-        wkc = ecx_SDOread(ctx, (uint16)pos, (uint16)index, 1, FALSE, &size, state, t);
+        wkc = 0;
+        t = budget_timeout_us(deadline);
+        if (t > 0)
+            wkc = ecx_SDOread(ctx, (uint16)pos, (uint16)index, 1, FALSE, &size, state, t);
+        pthread_mutex_unlock(&inst->acyclic_lock);
         if (wkc > 0 && size >= 1) {
             md->known = true;
             md->status = state[0];

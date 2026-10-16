@@ -23,11 +23,7 @@
 #include "log.h"
 #include "soem/soem.h"
 
-/*
- * Per-master and per-slave buffers are heap-allocated, sized from the loaded configuration;
- * an allocation failure refuses the configuration or the start. Fixed: ECAT_MAX_MASTERS and
- * ECAT_MAX_NAME_LEN. One direction of the process image is bounded by EDOG_FRAME_MAX_PAYLOAD.
- */
+/* Buffers are heap-allocated from the configuration; only these two limits are fixed. */
 #define ECAT_MAX_MASTERS      4
 #define ECAT_MAX_NAME_LEN    64
 
@@ -714,12 +710,9 @@ const char *ecat_data_type_to_string(ecat_data_type_t dt);
  * =============================================================================
  * Destructors for heap-allocated per-master and per-slave state
  * =============================================================================
- *
- * Ownership rule: a parsed config owns every pointer it has allocated. On any error during
- * parse_slaves_section / parse_slave / parse_pdo_array / parse_pdo, call ecat_config_destroy()
- * to release what was allocated so far. The destructors are idempotent and null-safe: calling
- * on a zero-initialized struct is a no-op.
  */
+
+/* A parsed config owns its pointers. The destructors are idempotent and null-safe. */
 
 /** Free the entries buffer owned by @p pdo. Resets pdo to zero fields. */
 void ecat_pdo_destroy(ecat_pdo_t *pdo);
@@ -750,10 +743,7 @@ void ecat_master_instance_destroy(ecat_master_instance_t *inst);
    than ever allocating a zero-byte buffer. */
 #define ECAT_IOMAP_MIN_BYTES    256
 
-/* Per-slave alignment slack. ec_config_map_group pads each slave to a byte boundary and
-   each sync manager to a word boundary.  32 bytes per slave covers up to 4 sync managers
-   per slave plus per-slave book-keeping with headroom to spare -- stations stay well under
-   the host memory any realistic project needs. */
+/* Per-slave slack for SOEM's byte and word alignment of slaves and sync managers. */
 #define ECAT_IOMAP_SLACK_PER_SLAVE 32
 
 /** Allocate inst->iomap sized from the parsed project configuration.  Walks every slave's

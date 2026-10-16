@@ -300,9 +300,11 @@ static int write_sdo_json_fields(const char *extra_fields)
     return 0;
 }
 
+static int write_sdo_json_with_datatype(const char *data_type, const char *extra_fields);
+
 void test_sdo_parse_ByteStringAscii_ShouldStoreBytes(void)
 {
-    write_sdo_json_fields("\"value_bytes\":\"UR20-4DI-P\"");
+    write_sdo_json_with_datatype("VISIBLE_STRING", "\"value_bytes\":\"UR20-4DI-P\"");
 
     static ecat_config_t config;
     int rc = ecat_config_parse(TEMP_FILE, &config);
@@ -320,7 +322,7 @@ void test_sdo_parse_ByteStringAscii_ShouldStoreBytes(void)
 
 void test_sdo_parse_ByteStringHex_ShouldDecodeHexPairs(void)
 {
-    write_sdo_json_fields("\"value_bytes\":\"0xDEADBEEF\"");
+    write_sdo_json_with_datatype("OCTET_STRING", "\"value_bytes\":\"0xDEADBEEF\"");
 
     static ecat_config_t config;
     int rc = ecat_config_parse(TEMP_FILE, &config);
@@ -340,7 +342,7 @@ void test_sdo_parse_ByteStringHex_ShouldDecodeHexPairs(void)
 
 void test_sdo_parse_ByteStringHexOddNibbles_ShouldReject(void)
 {
-    write_sdo_json_fields("\"value_bytes\":\"0xABC\"");
+    write_sdo_json_with_datatype("OCTET_STRING", "\"value_bytes\":\"0xABC\"");
 
     static ecat_config_t config;
     int rc = ecat_config_parse(TEMP_FILE, &config);
@@ -458,18 +460,24 @@ void test_sdo_parse_VisibleStringWithoutBytes_ShouldReject(void)
     cleanup_temp();
 }
 
-void test_sdo_parse_UnknownTypeWithBytes_ShouldAccept(void)
+void test_sdo_parse_UnknownTypeWithBytes_ShouldReject(void)
 {
-    /* The editor may send an unfamiliar type name while still carrying a byte-string
-       payload (e.g. a vendor-specific type on a modular coupler).  The parser treats
-       such an SDO as a byte-string write rather than rejecting it. */
     write_sdo_json_with_datatype("VENDOR_WIDGET", "\"value_bytes\":\"ok\"");
 
     static ecat_config_t config;
     int rc = ecat_config_parse(TEMP_FILE, &config);
-    TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, rc);
-    TEST_ASSERT_EQUAL_INT(ECAT_DTYPE_BYTESTRING, config.slaves[0].sdo_configs[0].parsed_type);
+    TEST_ASSERT_NOT_EQUAL(ECAT_CONFIG_OK, rc);
 
-    ecat_config_destroy(&config);
+    cleanup_temp();
+}
+
+void test_sdo_parse_NumericTypeWithBytes_ShouldReject(void)
+{
+    write_sdo_json_with_datatype("UINT32", "\"value_bytes\":\"0x01020304\"");
+
+    static ecat_config_t config;
+    int rc = ecat_config_parse(TEMP_FILE, &config);
+    TEST_ASSERT_NOT_EQUAL(ECAT_CONFIG_OK, rc);
+
     cleanup_temp();
 }

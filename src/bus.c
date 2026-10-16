@@ -1108,24 +1108,32 @@ bool ecat_bus_any_active(void)
     return false;
 }
 
-static void destroy_instance(ecat_master_instance_t *inst)
+/* Frees a stopped master. Returns false, freeing nothing, while one of its threads runs. */
+static bool destroy_instance(ecat_master_instance_t *inst)
 {
-    /* Nothing may be freed while a thread of this master still runs. */
-    assert(!atomic_load(&inst->bus_running));
+    bool running = atomic_load(&inst->bus_running);
 #if ECAT_ENABLE_MONITOR_THREAD
-    assert(!atomic_load(&inst->monitor_running));
+    running = running || atomic_load(&inst->monitor_running);
 #endif
+    if (running) {
+        edog_log_error(&g_logger, "Master '%s': not freed, a thread is still running", inst->name);
+        return false;
+    }
     ecat_data_destroy(inst);
     ecat_master_instance_destroy(inst);
     pthread_mutex_destroy(&inst->acyclic_lock);
     pthread_mutex_destroy(&inst->slaves_mutex);
+    return true;
 }
 
 static void free_masters(void)
 {
+    bool all_freed = true;
     for (int i = 0; i < g_master_count; i++)
-        destroy_instance(&g_masters[i]);
-    free(g_masters);
+        all_freed = destroy_instance(&g_masters[i]) && all_freed;
+    /* A running thread still points into the array: leak it rather than free it. */
+    if (all_freed)
+        free(g_masters);
     g_masters = NULL;
     g_master_count = 0;
 }
@@ -2122,8 +2130,8 @@ static int scan_modules_on_interface(cJSON *params, ecat_reply_t *out)
     return rc;
 }
 
-/*
- * "scan-modules": the detected module list (0xF050) of an ETG.5001 coupler.
+/**
+ * @brief "scan-modules": the detected module list (0xF050) of an ETG.5001 coupler.
  *
  * Request:  {"command":"scan-modules","params":{"master":M,"slave":S}}
  *       or  {"command":"scan-modules","params":{"interface":"eth0","slave":S}}
@@ -2200,8 +2208,8 @@ static const ecat_slave_t *find_modular_slave(const ecat_master_instance_t *inst
     return NULL;
 }
 
-/*
- * "diagnostics-slave": status of a running modular coupler and its configured modules.
+/**
+ * @brief "diagnostics-slave": status of a running modular coupler and its configured modules.
  *
  * Request:  {"command":"diagnostics-slave","params":{"master":M,"slave":S}}
  * Response: {"status":"success","master":M,"slave":S,
@@ -2224,15 +2232,16 @@ static int handle_diagnostics_slave_command(cJSON *root, ecat_reply_t *out)
         return reply_error(out, "slave is not a configured modular coupler");
     if (!inst->soem_initialized || !atomic_load(&inst->bus_running))
         return reply_error(out, "the bus is not running");
+    /* The reader takes the lock per SDO so recovery can run between reads. */
     if (acyclic_lock_timed(inst, ECAT_ACYCLIC_WAIT_MS) != 0)
         return reply_error(out, "bus recovering, retry");
+    pthread_mutex_unlock(&inst->acyclic_lock);
 
     ecat_coupler_diag_t diag;
     char err[200];
     err[0] = '\0';
     int rc = ecat_master_read_coupler_diagnostics(inst, slave, ECAT_DIAG_BUDGET_MS, &diag, err,
                                                   sizeof(err), &g_logger);
-    pthread_mutex_unlock(&inst->acyclic_lock);
     if (rc != 0) {
         ecat_coupler_diag_free(&diag);
         return reply_error(out, err[0] ? err : "diagnostics read failed");

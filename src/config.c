@@ -561,30 +561,26 @@ static int parse_sdo(const cJSON *sdo_json, ecat_sdo_config_t *sdo)
         return ECAT_CONFIG_ERR_INVALID;
     }
 
-    /* data_type: required, must resolve to a known type.  UNKNOWN/PAD reject
-       UNLESS the SDO carries a value_bytes payload — a byte-string write is a
-       raw-byte wire operation whose type name only has to tell us the payload
-       is bytes, so VISIBLE_STRING / OCTET_STRING / STRING are accepted here
-       and any other type is tolerated when value_bytes is present (the
-       numeric range check below is skipped on the value_bytes branch). */
+    /* data_type: a known type; value_bytes requires a byte-string type and vice versa. */
     const char *dtype_str = get_string(sdo_json, "data_type", "");
     sdo->parsed_type = ecat_parse_data_type(dtype_str);
     const cJSON *vbytes_lookahead = cJSON_GetObjectItemCaseSensitive(sdo_json, "value_bytes");
     const bool has_value_bytes =
         cJSON_IsString(vbytes_lookahead) && vbytes_lookahead->valuestring != NULL;
     if (sdo->parsed_type == ECAT_DTYPE_UNKNOWN || sdo->parsed_type == ECAT_DTYPE_PAD) {
-        if (has_value_bytes) {
-            /* Any type name is tolerated on a byte-string write; treat the
-               payload as a byte string regardless of what the editor named it. */
-            sdo->parsed_type = ECAT_DTYPE_BYTESTRING;
-        } else {
-            edog_log_error(g_config_logger,
-                "SDO %s:%d 'data_type' invalid: '%s' "
-                "(use BOOL/INT8/UINT8/INT16/UINT16/INT32/UINT32/INT64/UINT64/REAL/LREAL "
-                "or VISIBLE_STRING/OCTET_STRING with value_bytes)",
-                sdo->index, sdo->subindex, dtype_str);
-            return ECAT_CONFIG_ERR_INVALID;
-        }
+        edog_log_error(g_config_logger,
+            "SDO %s:%d 'data_type' invalid: '%s' "
+            "(use BOOL/INT8/UINT8/INT16/UINT16/INT32/UINT32/INT64/UINT64/REAL/LREAL "
+            "or VISIBLE_STRING/OCTET_STRING/STRING with value_bytes)",
+            sdo->index, sdo->subindex, dtype_str);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
+    if (has_value_bytes && sdo->parsed_type != ECAT_DTYPE_BYTESTRING) {
+        edog_log_error(g_config_logger,
+            "SDO %s:%d 'value_bytes' requires data_type VISIBLE_STRING, OCTET_STRING or "
+            "STRING, not '%s'",
+            sdo->index, sdo->subindex, dtype_str);
+        return ECAT_CONFIG_ERR_INVALID;
     }
     if (sdo->parsed_type == ECAT_DTYPE_BYTESTRING && !has_value_bytes) {
         edog_log_error(g_config_logger,
@@ -593,10 +589,7 @@ static int parse_sdo(const cJSON *sdo_json, ecat_sdo_config_t *sdo)
         return ECAT_CONFIG_ERR_INVALID;
     }
 
-    /* Optional "value_bytes" overrides "value" and carries a raw byte string. Two
-     * input shapes: a plain string ("UR20-4DI-P") is taken as its UTF-8 bytes, and a
-     * "0x..." prefix is parsed as hex pairs. When present, the numeric value and the
-     * range check are skipped: the payload wire-type is the bytes themselves. */
+    /* value_bytes replaces value: "0x" + hex pairs is always hex, any other string is its bytes. */
     sdo->value_bytes = NULL;
     sdo->value_bytes_len = 0;
     const cJSON *vbytes = cJSON_GetObjectItemCaseSensitive(sdo_json, "value_bytes");
@@ -1610,10 +1603,7 @@ int ecat_layout_init(ecat_layout_t *layout, int capacity)
  * concurrency guards are needed: the allocation ordering is enforced in master.c and
  * the two-consecutive-loads integration test is the gate for the lifecycle.
  */
-/* Compute the iomap bytes a configuration needs by summing every PDO entry's bit length
- * and adding alignment slack per slave.  Walks the parsed config, so the number is
- * knowable at allocation time (ecx_config_init populates slave identity but not Obytes
- * / Ibytes, so we can't ask SOEM yet).  Returns at least ECAT_IOMAP_MIN_BYTES. */
+/* Iomap bytes for the configured PDOs plus per-slave slack; at least ECAT_IOMAP_MIN_BYTES. */
 static size_t compute_iomap_bytes(const ecat_config_t *config)
 {
     size_t total_bits = 0;

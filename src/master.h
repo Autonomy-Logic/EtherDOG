@@ -295,8 +295,9 @@ typedef struct {
  * @brief Read a running modular coupler's status (0xF100) and its modules' states.
  *
  * Module state is 0xA000 + (slot - 1) * slot_index_increment, sub-index 1, for every module of
- * the configuration. Reads that fail or exceed @p budget_ms leave their value unknown. Caller
- * holds the master's acyclic lock and frees @p out with ecat_coupler_diag_free.
+ * the configuration. Reads that fail or exceed @p budget_ms leave their value unknown. Takes the
+ * master's acyclic lock around each SDO, so the caller must not hold it; free @p out with
+ * ecat_coupler_diag_free.
  *
  * @return 0, or -1 with @p err filled when the bus is not running or the slave has no CoE.
  */
