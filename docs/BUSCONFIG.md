@@ -39,10 +39,12 @@ Every field below is optional unless marked **required**. The defaults are shown
 | `position` | **required** | 1-based position on the bus. |
 | `name` | `""` | Display name. |
 | `type` | `"coupler"` | Free-form. |
-| `vendor_id` | `"0x0"` | Hex string. Checked against the bus when `startup_checks.check_vendor_id` is set. |
-| `product_code` | `"0x0"` | Hex string. Checked when `startup_checks.check_product_code` is set. |
+| `vendor_id` | **required** | Hex string, non-zero. Checked against the bus when `startup_checks.check_vendor_id` is set. |
+| `product_code` | **required** | Hex string, non-zero. Checked when `startup_checks.check_product_code` is set. |
 | `revision` | `"0x0"` | Hex string. Informational. |
-| `rx_pdos`, `tx_pdos` | `[]` | Output (RxPDO) and input (TxPDO) PDOs, in the order the slave maps them. |
+| `rx_pdos`, `tx_pdos` | `[]` | Output (RxPDO) and input (TxPDO) PDOs, in the order the slave maps them. A PDO index may appear once per slave across both lists. |
+| `mandatory_pdos` | `[]` | Hex PDO indices the device requires to be assigned. The configuration is refused when one is missing from `rx_pdos`/`tx_pdos`. |
+| `modular` | absent | Slot rules and modules of an ETG.5001 modular coupler; see below. |
 | `channels` | `[]` | Named I/O points. Each one references a PDO entry. |
 | `sdo_configurations` | `[]` | SDO writes applied in PRE-OP. |
 | `config` | see below | Per-slave settings. |
@@ -50,9 +52,14 @@ Every field below is optional unless marked **required**. The defaults are shown
 A PDO:
 
 ```json
-{ "index": "0x1A00", "name": "Channel 1",
+{ "index": "0x1A00", "name": "Channel 1", "fixed": true,
   "entries": [ { "index": "0x6000", "subindex": 1, "bit_length": 1, "name": "Input", "data_type": "BOOL" } ] }
 ```
+
+- Hex values (`vendor_id`, `product_code`, `revision`, indices, idents) are `0x` or `#x` followed by 1 to 8 hex digits.
+- `fixed` (default `false`): the mapping is fixed in the device. On a slave that is not a
+  modular coupler, EtherDOG reads the mapping object in PRE-OP before mapping and aborts the
+  start when the device maps different entries. A mapping it cannot read is logged and skipped.
 
 - An entry with index `0x0000` (or data type `PAD`) is padding. It takes up bits but is not published.
 - Data types: `BOOL`, `INT8`/`SINT`, `UINT8`/`USINT`, `INT16`/`INT`, `UINT16`/`UINT`, `INT32`/`DINT`, `UINT32`/`UDINT`, `INT64`/`LINT`, `UINT64`/`ULINT`, `REAL`/`REAL32`/`FLOAT`, `LREAL`/`REAL64`/`DOUBLE`, `PAD`.
@@ -69,6 +76,51 @@ An SDO:
 ```json
 { "index": "0x8000", "subindex": 1, "value": 3, "data_type": "UINT16", "name": "Filter" }
 ```
+
+Two optional additions:
+
+- `value_bytes` carries a raw byte-string payload instead of a numeric `value`. A string
+  that starts with `0x` (or `0X`) is always decoded as hex pairs and must have an even,
+  non-zero number of hex digits; any other string is taken as its UTF-8 bytes (no trailing
+  NUL). A text payload that itself begins with `0x` therefore has to be sent in hex form.
+  When present, `value` and the numeric range check are not consulted. Needed for ETG.5001
+  module `InitCmd` writes like `0x80n0:03 = "UR20-4DI-P"` that no numeric type can represent.
+
+  `data_type` for a byte-string write must be `VISIBLE_STRING`, `OCTET_STRING` or `STRING`;
+  any other `data_type` with `value_bytes`, and any of these three without it, is refused at
+  load.
+- `complete_access`: `true` sends the SDO with CoE Complete Access (one PDU updates every
+  sub-index of the object). Required for `0xF030` on couplers that advertise
+  CompleteAccess. Defaults to `false`.
+
+```json
+{ "index": "0x8010", "subindex": 3, "value_bytes": "UR20-4DI-P",
+  "data_type": "VISIBLE_STRING", "name": "Module name init" }
+```
+
+### slaves[].modular
+
+```json
+{ "slot_index_increment": 16,
+  "slots": [ { "min_instances": 0, "max_instances": 63, "module_classes": ["Di", "Do"], "module_idents": [] } ],
+  "modules": [ { "slot": 1, "ident": "0x00091F84", "class": "Di" } ] }
+```
+
+| Field | Meaning |
+|---|---|
+| `slot_index_increment` | Object index step from one slot to the next (ESI `SlotIndexIncrement`), 0 to 4095. With 0, module states are not read. |
+| `slots[]` | The coupler's `<Slot>` definitions, in order. `min_instances` to `max_instances` (at least 1) physical slots each. A slot accepts a module whose ident is in `module_idents` or whose class is in `module_classes`; with both empty it accepts any module. |
+| `modules[]` | The configured modules, in rising slot order, one per slot. `slot` is 1-based, `ident` is the module ident (hex), `class` its module class (optional). |
+
+Physical slots 1 to the last configured one fill the slot definitions in order: a definition
+takes slots until it holds `max_instances`, or, once it holds `min_instances`, until the next
+module is one it does not accept. An empty slot counts towards the current definition. The
+configuration is refused when a module lands in a definition that does not accept it, when the
+slots run past the last definition, or when a definition ends with fewer than `min_instances`.
+
+The module list (`0xF030`), module `InitCmd`s and PDO assignment are ordinary
+`sdo_configurations`; `modular` only describes the station so EtherDOG can check it and
+read the modules' diagnostics.
 
 ### slaves[].config
 
@@ -88,20 +140,43 @@ An SDO:
 
 ## Limits
 
-A configuration that exceeds any of these is refused as a whole; nothing is truncated.
+Per-master and per-slave buffers are heap-allocated at config load, so the only remaining
+limits are the ones the protocols or EtherDOG's own addressing model enforce. A configuration
+that cannot be allocated, or that fails a check above, is refused as a whole; nothing is
+truncated.
 
-| Item | Limit |
-|---|---|
-| Masters | 4 |
-| Slaves per master | 64 |
-| PDOs per slave, per direction | 16 |
-| Entries per PDO | 32 |
-| Channels per slave | 64 |
-| SDO configurations per slave | 32 |
-| Process data entries in a master's layout (both directions) | 8192 |
-| Process image per direction | 4096 bytes |
+| Item | Limit | Reason |
+|---|---|---|
+| Masters | 4 | Top-level cap; one bus per NIC in practice. |
+| Slaves per master | hardware memory | Allocated per project at upload. |
+| PDOs per slave, per direction | hardware memory | Allocated per project at upload. |
+| Entries per PDO | hardware memory | Allocated per project at upload. |
+| Channels per slave | hardware memory | Allocated per project at upload. |
+| SDO configurations per slave | hardware memory | Allocated per project at upload. |
+| Process image per direction | 65483 bytes | One data-channel datagram: the IPv4 UDP payload limit (65507) minus the 24-byte frame header. |
+
+The IOmap is allocated at start from the configured PDOs. After the startup SDOs, and before
+SOEM maps the process data, it grows to what the slaves report through the same sources SOEM
+reads (CoE PDO assignment, SoE, SII), plus a per-slave alignment slack
+(`ECAT_IOMAP_SLACK_PER_SLAVE`) and a floor (`ECAT_IOMAP_MIN_BYTES`). Allocation failures
+surface as out-of-memory errors. The data-channel frame buffers are allocated from the layout
+at start and freed at stop.
 
 Names (masters, slaves, PDOs, entries) longer than 63 characters are shortened to 63.
+
+## Protocol capabilities
+
+The `hello` control-socket response advertises the EtherCAT feature set so a newer
+editor can refuse to compile a project that targets this EtherDOG with features it does
+not support. Current features:
+
+| Name | Meaning |
+|---|---|
+| `ethercat.dynamic_alloc` | Buffers sized from the configuration; `modular`, `mandatory_pdos` and `fixed` are checked. |
+| `ethercat.sdo_byte_string` | `sdo_configurations[].value_bytes` is honoured. |
+| `ethercat.sdo_complete_access` | `sdo_configurations[].complete_access` is honoured. |
+| `ethercat.scan_modules` | The `scan-modules` command reads `0xF050` on a slave ([PROTOCOL.md](PROTOCOL.md)). |
+| `ethercat.diagnostics_slave` | The `diagnostics-slave` command reads a modular coupler's status ([PROTOCOL.md](PROTOCOL.md)). |
 
 ## Example
 
