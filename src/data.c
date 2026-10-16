@@ -12,6 +12,7 @@
 
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -27,7 +28,61 @@ int ecat_data_init(ecat_master_instance_t *inst)
 void ecat_data_destroy(ecat_master_instance_t *inst)
 {
     ecat_data_close(inst);
+    ecat_data_free_buffers(inst);
     pthread_mutex_destroy(&inst->data.lock);
+}
+
+int ecat_data_alloc_buffers(ecat_master_instance_t *inst, char *err, size_t err_size)
+{
+    ecat_data_session_t *d = &inst->data;
+    uint32_t out_bytes = inst->layout.output_bytes;
+    uint32_t in_bytes = inst->layout.input_bytes;
+    if (out_bytes > EDOG_FRAME_MAX_PAYLOAD || in_bytes > EDOG_FRAME_MAX_PAYLOAD) {
+        snprintf(err, err_size, "process image (out=%u in=%u bytes) exceeds the %d-byte frame payload",
+                 out_bytes, in_bytes, EDOG_FRAME_MAX_PAYLOAD);
+        return -1;
+    }
+    /* One spare byte: an oversized datagram then fails the length check instead of fitting. */
+    size_t rx_size = (size_t)EDOG_FRAME_HEADER_SIZE + out_bytes + 1;
+    size_t tx_size = (size_t)EDOG_FRAME_HEADER_SIZE + in_bytes;
+    uint8_t *rx = calloc(1, rx_size);
+    uint8_t *latest = calloc(1, out_bytes > 0 ? out_bytes : 1);
+    uint8_t *tx = calloc(1, tx_size);
+    if (rx == NULL || latest == NULL || tx == NULL) {
+        free(rx);
+        free(latest);
+        free(tx);
+        snprintf(err, err_size, "out of memory allocating data frame buffers (%zu+%zu bytes)", rx_size,
+                 tx_size);
+        return -1;
+    }
+
+    pthread_mutex_lock(&d->lock);
+    free(d->rx_buf);
+    free(d->rx_latest);
+    free(d->tx_buf);
+    d->rx_buf = rx;
+    d->rx_buf_size = rx_size;
+    d->rx_latest = latest;
+    d->tx_buf = tx;
+    d->tx_buf_size = tx_size;
+    pthread_mutex_unlock(&d->lock);
+    return 0;
+}
+
+void ecat_data_free_buffers(ecat_master_instance_t *inst)
+{
+    ecat_data_session_t *d = &inst->data;
+    pthread_mutex_lock(&d->lock);
+    free(d->rx_buf);
+    free(d->rx_latest);
+    free(d->tx_buf);
+    d->rx_buf = NULL;
+    d->rx_latest = NULL;
+    d->tx_buf = NULL;
+    d->rx_buf_size = 0;
+    d->tx_buf_size = 0;
+    pthread_mutex_unlock(&d->lock);
 }
 
 static uint64_t random_session(void)
@@ -77,6 +132,11 @@ int ecat_data_open(ecat_master_instance_t *inst, int master_index, const char *c
     ecat_data_session_t *d = &inst->data;
     pthread_mutex_lock(&d->lock);
     close_locked(d);
+    if (d->rx_buf == NULL || d->tx_buf == NULL) {
+        pthread_mutex_unlock(&d->lock);
+        snprintf(err, err_size, "data buffers not allocated; start the bus first");
+        return -1;
+    }
 
     int fd = edog_dgram_open(&peer, state_dir, master_index, d->local_path,
                              sizeof(d->local_path), endpoint_out, endpoint_size, err, err_size);
@@ -126,14 +186,14 @@ void ecat_data_apply_outputs(ecat_master_instance_t *inst, int master_index)
         return;
     }
 
-    uint8_t buf[EDOG_FRAME_HEADER_SIZE + EDOG_FRAME_MAX_PAYLOAD];
-    uint8_t latest[EDOG_FRAME_MAX_PAYLOAD];
+    uint8_t *buf = d->rx_buf;
+    uint8_t *latest = d->rx_latest;
     bool have_new = false;
     bool latest_valid = false;
 
     for (;;) {
         bool from_peer = false;
-        ssize_t n = edog_dgram_recv(d->fd, buf, sizeof(buf), &d->peer, &from_peer);
+        ssize_t n = edog_dgram_recv(d->fd, buf, d->rx_buf_size, &d->peer, &from_peer);
         if (n < 0)
             break; /* EAGAIN: drained */
 
@@ -181,12 +241,12 @@ void ecat_data_publish_inputs(ecat_master_instance_t *inst, int master_index, in
 
     if (pthread_mutex_trylock(&d->lock) != 0)
         return;
-    if (!d->open || d->fd < 0) {
+    if (!d->open || d->fd < 0 || d->tx_buf == NULL || d->tx_buf_size < EDOG_FRAME_HEADER_SIZE + in_bytes) {
         pthread_mutex_unlock(&d->lock);
         return;
     }
 
-    uint8_t buf[EDOG_FRAME_HEADER_SIZE + EDOG_FRAME_MAX_PAYLOAD];
+    uint8_t *buf = d->tx_buf;
     edog_frame_header_t h = {
         .version = EDOG_PROTOCOL_VERSION,
         .kind = EDOG_FRAME_INPUTS,

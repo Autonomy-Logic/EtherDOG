@@ -30,7 +30,8 @@
 
 #define EDOG_PROTOCOL_VERSION 1
 #define EDOG_FRAME_HEADER_SIZE 24
-#define EDOG_FRAME_MAX_PAYLOAD 4096
+/* Largest UDP payload over IPv4 (65507) minus the header. */
+#define EDOG_FRAME_MAX_PAYLOAD (65507 - EDOG_FRAME_HEADER_SIZE)
 
 enum {
     EDOG_FRAME_OUTPUTS = 1,

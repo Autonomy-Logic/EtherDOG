@@ -14,6 +14,7 @@
 #define ETHERCAT_CONFIG_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
@@ -22,14 +23,8 @@
 #include "log.h"
 #include "soem/soem.h"
 
-/* Maximum sizes */
+/* Buffers are heap-allocated from the configuration; only these two limits are fixed. */
 #define ECAT_MAX_MASTERS      4
-#define ECAT_MAX_SLAVES      64
-#define ECAT_IOMAP_SIZE    8192
-#define ECAT_MAX_CHANNELS    64
-#define ECAT_MAX_PDO_ENTRIES 32
-#define ECAT_MAX_PDOS        16
-#define ECAT_MAX_SDOS        32
 #define ECAT_MAX_NAME_LEN    64
 
 /**
@@ -52,7 +47,11 @@ typedef enum {
     ECAT_DTYPE_UINT64,
     ECAT_DTYPE_REAL32,
     ECAT_DTYPE_REAL64,
-    ECAT_DTYPE_PAD
+    ECAT_DTYPE_PAD,
+    /* Byte-string wire type (CoE VISIBLE_STRING / OCTET_STRING).  The length and
+       the bytes themselves travel in ecat_sdo_config_t.value_bytes; the SDO's
+       numeric `value` is unused. */
+    ECAT_DTYPE_BYTESTRING
 } ecat_data_type_t;
 
 /* Error codes */
@@ -84,10 +83,12 @@ typedef struct {
  * RxPDOs are written to the slave, TxPDOs are read from the slave.
  */
 typedef struct {
-    char             index[12];  /* hex string e.g. "0x1A00" */
-    char             name[ECAT_MAX_NAME_LEN];
-    ecat_pdo_entry_t entries[ECAT_MAX_PDO_ENTRIES];
-    int              entry_count;
+    char              index[12];  /* hex string e.g. "0x1A00" */
+    char              name[ECAT_MAX_NAME_LEN];
+    ecat_pdo_entry_t *entries;         /* heap-owned, allocated at config load */
+    int               entry_count;
+    int               entry_capacity;
+    bool              fixed;           /* mapping fixed in the device (ESI Fixed) */
 } ecat_pdo_t;
 
 /**
@@ -99,8 +100,14 @@ typedef struct {
 typedef struct {
     char             index[12];        /* hex string e.g. "0x8000" */
     uint8_t          subindex;
-    double           value;            /* stored as double; cast to target type at write time */
+    double           value;            /* numeric payload; valid when value_bytes == NULL */
+    /* Byte-string payload (e.g. a module name written to 0x80n0:03). Heap-owned, freed by
+     * ecat_slave_destroy. When non-NULL it is written instead of @c value. */
+    uint8_t         *value_bytes;
+    size_t           value_bytes_len;
     ecat_data_type_t parsed_type;      /* resolved from data_type string in JSON */
+    /* Write with CoE Complete Access: one request covers every sub-index from 0. */
+    bool             complete_access;
     char             name[ECAT_MAX_NAME_LEN];
 } ecat_sdo_config_t;
 
@@ -178,6 +185,33 @@ typedef struct {
     int      sync1_shift_us;
 } ecat_dc_config_t;
 
+/** One `<Slot>` definition of a modular coupler (ETG.5001). */
+typedef struct {
+    int       min_instances;
+    int       max_instances;
+    char    (*classes)[ECAT_MAX_NAME_LEN]; /* heap-owned; module classes the slot accepts */
+    int       class_count;
+    uint32_t *idents;                       /* heap-owned; module idents the slot accepts */
+    int       ident_count;
+} ecat_slot_def_t;
+
+/** A module configured in one slot of a modular coupler. */
+typedef struct {
+    int      slot;                          /* 1-based */
+    uint32_t ident;
+    char     class_name[ECAT_MAX_NAME_LEN]; /* "" when unknown */
+} ecat_module_t;
+
+/** The `modular` section of a coupler: slot rules and the configured station. */
+typedef struct {
+    bool             present;
+    int              slot_index_increment;  /* object index step per slot, e.g. 16; 0 = none */
+    ecat_slot_def_t *slots;                 /* heap-owned */
+    int              slot_count;
+    ecat_module_t   *modules;               /* heap-owned, in slot order */
+    int              module_count;
+} ecat_modular_t;
+
 /**
  * @brief EtherCAT slave configuration
  *
@@ -186,20 +220,24 @@ typedef struct {
  * settings for timeouts, watchdogs, and distributed clocks.
  */
 typedef struct {
-    int               position;        /* ec_slave[position] in SOEM (1-based) */
-    char              name[ECAT_MAX_NAME_LEN];
-    char              type[20];        /* "coupler", "digital_input", etc. */
-    uint32_t          vendor_id;
-    uint32_t          product_code;
-    uint32_t          revision;
-    ecat_channel_t    channels[ECAT_MAX_CHANNELS];
-    int               channel_count;
-    ecat_sdo_config_t sdo_configs[ECAT_MAX_SDOS];
-    int               sdo_count;
-    ecat_pdo_t        rx_pdos[ECAT_MAX_PDOS];
-    int               rx_pdo_count;
-    ecat_pdo_t        tx_pdos[ECAT_MAX_PDOS];
-    int               tx_pdo_count;
+    int                position;       /* ec_slave[position] in SOEM (1-based) */
+    char               name[ECAT_MAX_NAME_LEN];
+    char               type[20];       /* "coupler", "digital_input", etc. */
+    uint32_t           vendor_id;
+    uint32_t           product_code;
+    uint32_t           revision;
+    ecat_channel_t    *channels;       /* heap-owned */
+    int                channel_count;
+    int                channel_capacity;
+    ecat_sdo_config_t *sdo_configs;    /* heap-owned */
+    int                sdo_count;
+    int                sdo_capacity;
+    ecat_pdo_t        *rx_pdos;        /* heap-owned; each entry's .entries is also heap-owned */
+    int                rx_pdo_count;
+    int                rx_pdo_capacity;
+    ecat_pdo_t        *tx_pdos;        /* heap-owned; each entry's .entries is also heap-owned */
+    int                tx_pdo_count;
+    int                tx_pdo_capacity;
     ecat_startup_checks_t startup_checks;
     ecat_addressing_t     addressing;
     ecat_timeouts_t       timeouts;
@@ -207,6 +245,10 @@ typedef struct {
     ecat_dc_config_t      dc;
     /* Abort master startup on any SDO write failure (default true). */
     bool                  strict_sdo;
+    /* PDO indices the device requires to be assigned (ESI Mandatory). Heap-owned. */
+    char                (*mandatory_pdos)[12];
+    int                   mandatory_pdo_count;
+    ecat_modular_t        modular;
 } ecat_slave_t;
 
 /**
@@ -243,15 +285,34 @@ typedef struct {
 
 /**
  * @brief Top-level bus configuration: master settings, slaves, diagnostics.
- *
- * About 7 MB (inline slave and PDO arrays): allocate statically or on the heap.
  */
 typedef struct {
     ecat_master_config_t      master;
-    ecat_slave_t              slaves[ECAT_MAX_SLAVES];
+    ecat_slave_t             *slaves;         /* heap-owned */
     int                       slave_count;
+    int                       slave_capacity;
     ecat_diagnostics_config_t diagnostics;
 } ecat_config_t;
+
+/* Per-master and per-slave buffers are heap pointers sized at load, never inline arrays. */
+_Static_assert(sizeof(((ecat_pdo_t *)0)->entries) == sizeof(void *),
+    "ecat_pdo_t.entries must stay a pointer, not an inline array");
+_Static_assert(sizeof(((ecat_slave_t *)0)->channels) == sizeof(void *),
+    "ecat_slave_t.channels must stay a pointer, not an inline array");
+_Static_assert(sizeof(((ecat_slave_t *)0)->sdo_configs) == sizeof(void *),
+    "ecat_slave_t.sdo_configs must stay a pointer, not an inline array");
+_Static_assert(sizeof(((ecat_slave_t *)0)->rx_pdos) == sizeof(void *),
+    "ecat_slave_t.rx_pdos must stay a pointer, not an inline array");
+_Static_assert(sizeof(((ecat_slave_t *)0)->tx_pdos) == sizeof(void *),
+    "ecat_slave_t.tx_pdos must stay a pointer, not an inline array");
+_Static_assert(sizeof(((ecat_config_t *)0)->slaves) == sizeof(void *),
+    "ecat_config_t.slaves must stay a pointer, not an inline array");
+_Static_assert(sizeof(((ecat_slave_t *)0)->mandatory_pdos) == sizeof(void *),
+    "ecat_slave_t.mandatory_pdos must stay a pointer, not an inline array");
+_Static_assert(sizeof(((ecat_modular_t *)0)->slots) == sizeof(void *),
+    "ecat_modular_t.slots must stay a pointer, not an inline array");
+_Static_assert(sizeof(((ecat_modular_t *)0)->modules) == sizeof(void *),
+    "ecat_modular_t.modules must stay a pointer, not an inline array");
 
 /**
  * @brief Parse EtherCAT configuration from a JSON file
@@ -450,9 +511,6 @@ typedef struct {
  * =============================================================================
  */
 
-/* Maximum PDO entries in a master's layout, both directions, mapped or not (about 112 bytes each) */
-#define ECAT_MAX_LAYOUT_ENTRIES 8192
-
 /**
  * @brief One PDO entry as it sits in the published process image.
  *
@@ -472,14 +530,15 @@ typedef struct {
 } ecat_layout_entry_t;
 
 typedef struct {
-    uint32_t            output_bytes;
-    uint32_t            input_bytes;
-    ecat_layout_entry_t entries[ECAT_MAX_LAYOUT_ENTRIES];
-    int                 entry_count;
+    uint32_t             output_bytes;
+    uint32_t             input_bytes;
+    ecat_layout_entry_t *entries;             /* heap-owned, sized at layout build */
+    int                  entry_count;
+    int                  entry_capacity;
 } ecat_layout_t;
 
-/** Largest datagram payload: one direction's region must fit in one frame. */
-#define ECAT_MAX_FRAME_PAYLOAD 4096
+_Static_assert(sizeof(((ecat_layout_t *)0)->entries) == sizeof(void *),
+    "ecat_layout_t.entries must stay a pointer, not an inline array");
 
 /**
  * @brief Cyclic data session with one client (see docs/PROTOCOL.md).
@@ -499,6 +558,12 @@ typedef struct {
     bool            rx_seen;             /* any valid output frame this session */
     uint32_t        cycles_since_output; /* for the output watchdog             */
     bool            outputs_zeroed;      /* watchdog already cleared outputs    */
+    /* Frame buffers sized from the layout at start, freed at stop. Bus thread only. */
+    uint8_t        *rx_buf;              /* one output frame plus one byte      */
+    size_t          rx_buf_size;
+    uint8_t        *rx_latest;           /* newest valid output payload         */
+    uint8_t        *tx_buf;              /* one input frame                     */
+    size_t          tx_buf_size;
     _Atomic(uint64_t) frames_rx;
     _Atomic(uint64_t) frames_tx;
     _Atomic(uint64_t) frames_dropped;
@@ -511,7 +576,7 @@ typedef struct {
  * =============================================================================
  */
 
-/** @brief All state of one master. About 7 MB: heap-allocate. */
+/** @brief All state of one master. Large (SOEM context): heap-allocate. */
 typedef struct {
     /* Identity */
     char name[ECAT_MAX_NAME_LEN];       /* master name from JSON config */
@@ -519,9 +584,11 @@ typedef struct {
     /* Configuration (parsed from JSON) */
     ecat_config_t config;
 
-    /* SOEM context and IOmap — per-instance, NOT shared */
+    /* SOEM context and IOmap, per instance. iomap is allocated at start from the configured
+     * PDOs and grown before mapping to what the slaves report. */
     ecx_contextt ecx_context;
-    uint8_t iomap[ECAT_IOMAP_SIZE];
+    uint8_t *iomap;
+    size_t iomap_capacity;
     int soem_initialized;
     size_t iomap_used_size;
 
@@ -554,10 +621,17 @@ typedef struct {
     _Atomic(uint64_t)  al_faults;                  /* replies not all-OP or short       */
     _Atomic(uint32_t)  recovery_al_trigger;        /* 0: WKC; else 0x10000 | AL status  */
 
-    /* Snapshot for status queries; the monitor owns slavelist[] and publishes here. */
-    ecat_slave_status_t slaves_snapshot[ECAT_MAX_SLAVES];
-    int                 slaves_snapshot_count;
-    pthread_mutex_t     slaves_mutex;
+    /* Snapshot for status queries; the monitor owns slavelist[] and publishes here. The
+     * buffer is sized from config.slave_count once at master start, never resized. */
+    ecat_slave_status_t *slaves_snapshot;
+    int                  slaves_snapshot_count;
+    int                  slaves_snapshot_capacity;
+    pthread_mutex_t      slaves_mutex;
+
+    /* Serializes mailbox traffic and recovery: monitor and control thread, never the bus thread. */
+    pthread_mutex_t      acyclic_lock;
+    /* Monitor-owned scratch for SOEM's error list, so a pass needs no stack array. */
+    ec_errort            monitor_errors[EC_MAXELIST];
 
 #if ECAT_ENABLE_MONITOR_THREAD
     /* Monitor thread: state checks, recovery, mailbox. Never blocks the bus thread. */
@@ -575,6 +649,15 @@ typedef struct {
     /* NIC tuning and IP isolation to revert on close; keeps its own iface name copy. */
     ecat_iface_state_t iface_state;
 } ecat_master_instance_t;
+
+_Static_assert(sizeof(((ecat_master_instance_t *)0)->iomap) == sizeof(void *),
+    "ecat_master_instance_t.iomap must stay a pointer, not an inline array");
+_Static_assert(sizeof(((ecat_master_instance_t *)0)->slaves_snapshot) == sizeof(void *),
+    "ecat_master_instance_t.slaves_snapshot must stay a pointer, not an inline array");
+_Static_assert(sizeof(((ecat_data_session_t *)0)->rx_buf) == sizeof(void *) &&
+               sizeof(((ecat_data_session_t *)0)->rx_latest) == sizeof(void *) &&
+               sizeof(((ecat_data_session_t *)0)->tx_buf) == sizeof(void *),
+    "ecat_data_session_t frame buffers must stay pointers, not inline arrays");
 
 /**
  * @brief Parse all EtherCAT master configurations from a JSON file
@@ -622,5 +705,61 @@ int ecat_data_type_size(ecat_data_type_t dt);
  * @return Static string ("UNKNOWN" for invalid or unrecognized values)
  */
 const char *ecat_data_type_to_string(ecat_data_type_t dt);
+
+/*
+ * =============================================================================
+ * Destructors for heap-allocated per-master and per-slave state
+ * =============================================================================
+ */
+
+/* A parsed config owns its pointers. The destructors are idempotent and null-safe. */
+
+/** Free the entries buffer owned by @p pdo. Resets pdo to zero fields. */
+void ecat_pdo_destroy(ecat_pdo_t *pdo);
+
+/** Free channels, sdo_configs, rx_pdos (each pdo's entries too), tx_pdos. Resets slave. */
+void ecat_slave_destroy(ecat_slave_t *slave);
+
+/** Free each slave and the slaves array itself. Does not free @p config (it may be embedded). */
+void ecat_config_destroy(ecat_config_t *config);
+
+/** Free the layout's entries buffer. */
+void ecat_layout_destroy(ecat_layout_t *layout);
+
+/** Allocate the layout's entries buffer with the given capacity. Returns 0 on success. */
+int ecat_layout_init(ecat_layout_t *layout, int capacity);
+
+/*
+ * =============================================================================
+ * Instance destructor and sizing
+ * =============================================================================
+ */
+
+/** Free iomap, slaves_snapshot, config contents and layout. Does not free @p inst itself. */
+void ecat_master_instance_destroy(ecat_master_instance_t *inst);
+
+/* Lower bound on the computed iomap size.  SOEM reserves a handful of bytes for its own
+   per-master book-keeping; the exact count is private, so we keep a small floor rather
+   than ever allocating a zero-byte buffer. */
+#define ECAT_IOMAP_MIN_BYTES    256
+
+/* Per-slave slack for SOEM's byte and word alignment of slaves and sync managers. */
+#define ECAT_IOMAP_SLACK_PER_SLAVE 32
+
+/** Allocate inst->iomap sized from the parsed project configuration.  Walks every slave's
+ *  rx_pdos and tx_pdos, sums the per-entry bit lengths, converts to bytes with alignment
+ *  slack, and allocates exactly that much.  No policy ceiling: when the host cannot grant
+ *  the required amount the allocation fails and the start reports it as OOM.  Returns 0
+ *  on success, -1 on OOM.  Must be called before ecx_config_map_group so the buffer is
+ *  available for SOEM to populate. */
+int ecat_master_instance_alloc_iomap(ecat_master_instance_t *inst);
+
+/** Replace inst->iomap with a zeroed buffer of at least @p bytes when the current one is
+ *  smaller. Only before ecx_config_map_group: SOEM keeps the pointer afterwards. 0 or -1 on OOM. */
+int ecat_master_instance_grow_iomap(ecat_master_instance_t *inst, size_t bytes);
+
+/** Allocate inst->slaves_snapshot sized for inst->config.slave_count. Must be called before
+ *  the bus thread starts. Returns 0 on success, -1 on OOM. */
+int ecat_master_instance_alloc_snapshot(ecat_master_instance_t *inst);
 
 #endif /* ETHERCAT_CONFIG_H */

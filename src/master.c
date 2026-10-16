@@ -19,9 +19,12 @@
 #include "soem/soem.h"
 
 #include <ctype.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 /* Low-latency socket option for the SOEM raw socket (Linux only).
  * Per-interface NIC tuning (ethtool coalescing/offloads) lives in
@@ -127,6 +130,14 @@ int ecat_master_validate_topology(ecat_master_instance_t *inst, edog_logger_t *l
     return 0;
 }
 
+void ecat_soem_release_failed_init(ecx_contextt *ctx)
+{
+    /* ecx_init creates the mailbox pool mutex before it opens the NIC; ecx_close would also
+     * close a socket that was never opened. */
+    osal_mutex_destroy(ctx->mbxpool.mbxmutex);
+    ctx->mbxpool.mbxmutex = NULL;
+}
+
 /*
  * =============================================================================
  * Phase 1: Open Interface, Scan Bus, Validate Topology
@@ -139,8 +150,16 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, edog_logger_t *logge
 
     /* Zero-initialize the SOEM context before use */
     memset(&inst->ecx_context, 0, sizeof(inst->ecx_context));
-    memset(inst->iomap, 0, sizeof(inst->iomap));
+
+    /* iomap and slaves_snapshot are allocated per start; release anything a failed start left. */
+    free(inst->iomap);
+    inst->iomap = NULL;
+    inst->iomap_capacity = 0;
     inst->iomap_used_size = 0;
+    free(inst->slaves_snapshot);
+    inst->slaves_snapshot = NULL;
+    inst->slaves_snapshot_capacity = 0;
+    inst->slaves_snapshot_count = 0;
 
     /* Step 0: Apply per-iface external state (NIC tuning + IP-stack
      * isolation).  Reverted in ecat_master_close. */
@@ -150,6 +169,7 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, edog_logger_t *logge
     edog_log_info(logger, "Opening network interface: %s", config->master.interface);
 
     if (!ecx_init(&inst->ecx_context, config->master.interface)) {
+        ecat_soem_release_failed_init(&inst->ecx_context);
 #if defined(__CYGWIN__) || defined(_WIN32)
         edog_log_error(logger,
             "Failed to initialize EtherCAT interface '%s'. "
@@ -211,6 +231,19 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, edog_logger_t *logge
         edog_log_info(logger,
             "  [%d] %s - vendor=0x%08X, product=0x%08X, rev=0x%08X",
             i, slave->name, slave->eep_man, slave->eep_id, slave->eep_rev);
+    }
+
+    /* iomap (from the configured PDOs, grown before mapping) and slaves_snapshot (from
+     * config.slave_count); both freed by ecat_master_close. */
+    if (ecat_master_instance_alloc_iomap(inst) != 0) {
+        ecx_close(&inst->ecx_context);
+        inst->soem_initialized = 0;
+        return -1;
+    }
+    if (ecat_master_instance_alloc_snapshot(inst) != 0) {
+        ecx_close(&inst->ecx_context);
+        inst->soem_initialized = 0;
+        return -1;
     }
 
     /* Step 3: Validate topology against JSON configuration */
@@ -343,30 +376,51 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
         /* Parse index from hex string */
         uint16_t index = (uint16_t)strtol(sdo->index, NULL, 16);
 
-        /* parse_sdo rejects UNKNOWN/PAD so encode_sdo_value() returning
-         * 0 here is a parser regression rather than user input -- skip
-         * the SDO defensively rather than crash. */
-        ecat_data_type_t dt = sdo->parsed_type;
-        uint8_t value_buf[8];
-        int size = encode_sdo_value(dt, sdo->value, value_buf);
-        if (size <= 0) {
-            edog_log_error(logger,
-                "Slave %d SDO 0x%04X:%d: unknown data type '%s' -- skipping (parser regression?)",
-                slave_pos, index, sdo->subindex,
-                ecat_data_type_to_string(dt));
-            continue;
-        }
+        /* value_bytes overrides the numeric value; complete_access writes with CA=TRUE. */
+        const uint8_t *wire_buf;
+        int size;
+        uint8_t numeric_buf[8];
 
-        const char *dt_name = ecat_data_type_to_string(dt);
-        if (dt == ECAT_DTYPE_REAL32 || dt == ECAT_DTYPE_REAL64) {
+        if (sdo->value_bytes != NULL && sdo->value_bytes_len > 0) {
+            wire_buf = sdo->value_bytes;
+            if (sdo->value_bytes_len > INT_MAX) {
+                edog_log_error(logger,
+                    "Slave %d SDO 0x%04X:%d: byte payload too large (%zu bytes)",
+                    slave_pos, index, sdo->subindex, sdo->value_bytes_len);
+                continue;
+            }
+            size = (int)sdo->value_bytes_len;
             edog_log_debug(logger,
-                "Slave %d: writing SDO 0x%04X:%d = %g (%s, %d bytes)",
-                slave_pos, index, sdo->subindex, sdo->value, dt_name, size);
+                "Slave %d: writing SDO 0x%04X:%d (byte-string, %d bytes%s)",
+                slave_pos, index, sdo->subindex, size,
+                sdo->complete_access ? ", CA" : "");
         } else {
-            edog_log_debug(logger,
-                "Slave %d: writing SDO 0x%04X:%d = %lld (%s, %d bytes)",
-                slave_pos, index, sdo->subindex, (long long)(int64_t)sdo->value,
-                dt_name, size);
+            /* parse_sdo rejects UNKNOWN/PAD so encode_sdo_value() returning
+             * 0 here is a parser regression rather than user input -- skip
+             * the SDO defensively rather than crash. */
+            ecat_data_type_t dt = sdo->parsed_type;
+            int encoded = encode_sdo_value(dt, sdo->value, numeric_buf);
+            if (encoded <= 0) {
+                edog_log_error(logger,
+                    "Slave %d SDO 0x%04X:%d: unknown data type '%s' -- skipping (parser regression?)",
+                    slave_pos, index, sdo->subindex,
+                    ecat_data_type_to_string(dt));
+                continue;
+            }
+            wire_buf = numeric_buf;
+            size = encoded;
+            const char *dt_name = ecat_data_type_to_string(dt);
+            if (dt == ECAT_DTYPE_REAL32 || dt == ECAT_DTYPE_REAL64) {
+                edog_log_debug(logger,
+                    "Slave %d: writing SDO 0x%04X:%d = %g (%s, %d bytes%s)",
+                    slave_pos, index, sdo->subindex, sdo->value, dt_name, size,
+                    sdo->complete_access ? ", CA" : "");
+            } else {
+                edog_log_debug(logger,
+                    "Slave %d: writing SDO 0x%04X:%d = %lld (%s, %d bytes%s)",
+                    slave_pos, index, sdo->subindex, (long long)(int64_t)sdo->value,
+                    dt_name, size, sdo->complete_access ? ", CA" : "");
+            }
         }
 
         /* Use per-slave SDO timeout if configured, otherwise SOEM default */
@@ -374,7 +428,8 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
 
         int wkc = ecx_SDOwrite(&inst->ecx_context, (uint16)slave_pos,
                                 index, sdo->subindex,
-                                FALSE, size, value_buf, sdo_timeout_us);
+                                sdo->complete_access ? TRUE : FALSE,
+                                size, (void *)wire_buf, sdo_timeout_us);
 
         if (wkc <= 0) {
             edog_log_warn(logger,
@@ -600,6 +655,55 @@ static void ecat_master_configure_dc(ecat_master_instance_t *inst, edog_logger_t
     }
 }
 
+/* Bits a slave maps per direction, from the same sources ecx_config_map_group reads. */
+static void slave_mapped_bits(ecx_contextt *ctx, uint16 slave, uint32 *obits, uint32 *ibits)
+{
+    ec_slavet *sl = &ctx->slavelist[slave];
+    uint32 osize = 0, isize = 0;
+    if (sl->mbx_proto & ECT_MBXPROT_COE) {
+        int ok = 0;
+        if (sl->CoEdetails & ECT_COEDET_SDOCA)
+            ok = ecx_readPDOmapCA(ctx, slave, 0, &osize, &isize);
+        if (!ok) {
+            osize = isize = 0;
+            ecx_readPDOmap(ctx, slave, &osize, &isize);
+        }
+    }
+    if (!osize && !isize && (sl->mbx_proto & ECT_MBXPROT_SOE))
+        ecx_readIDNmap(ctx, slave, &osize, &isize);
+    if (!osize && !isize) {
+        ec_eepromPDOt pdo;
+        memset(&pdo, 0, sizeof(pdo));
+        isize = ecx_siiPDO(ctx, slave, &pdo, 0);
+        memset(&pdo, 0, sizeof(pdo));
+        osize = ecx_siiPDO(ctx, slave, &pdo, 1);
+    }
+    *obits = osize > sl->Obits ? osize : sl->Obits;
+    *ibits = isize > sl->Ibits ? isize : sl->Ibits;
+}
+
+/* Grow the IOmap to what the slaves report after the startup SDOs, before SOEM maps into it. */
+static int size_iomap_from_slaves(ecat_master_instance_t *inst, edog_logger_t *logger)
+{
+    ecx_contextt *ctx = &inst->ecx_context;
+    size_t bytes = 0;
+    for (int i = 1; i <= ctx->slavecount; i++) {
+        uint32 obits = 0, ibits = 0;
+        slave_mapped_bits(ctx, (uint16)i, &obits, &ibits);
+        bytes += (obits + 7) / 8 + (ibits + 7) / 8 + ECAT_IOMAP_SLACK_PER_SLAVE;
+    }
+    if (bytes < ECAT_IOMAP_MIN_BYTES)
+        bytes = ECAT_IOMAP_MIN_BYTES;
+    if (ecat_master_instance_grow_iomap(inst, bytes) != 0) {
+        edog_log_error(logger, "Master '%s': IOmap allocation of %zu bytes failed", inst->name,
+                       bytes);
+        return -1;
+    }
+    edog_log_info(logger, "Master '%s': IOmap %zu bytes (slaves report %zu with slack)",
+                  inst->name, inst->iomap_capacity, bytes);
+    return 0;
+}
+
 int ecat_master_configure(ecat_master_instance_t *inst, edog_logger_t *logger)
 {
     const ecat_config_t *config = &inst->config;
@@ -612,16 +716,22 @@ int ecat_master_configure(ecat_master_instance_t *inst, edog_logger_t *logger)
     /* Step 4: map process data. A size of 0 means SOEM could not lay out the PDOs. */
     edog_log_info(logger, "Mapping process data...");
 
-    int io_size = ecx_config_map_group(&inst->ecx_context, &inst->iomap, 0);
+    if (size_iomap_from_slaves(inst, logger) != 0)
+        return -1;
+
+    int io_size = ecx_config_map_group(&inst->ecx_context, inst->iomap, 0);
     if (io_size <= 0) {
         edog_log_error(logger,
             "ecx_config_map_group returned %d -- process data mapping failed "
             "(likely SII / mailbox issue)", io_size);
         return -1;
     }
-    if (io_size > ECAT_IOMAP_SIZE) {
-        edog_log_error(logger, "IOmap overflow: need %d bytes, have %d",
-                            io_size, ECAT_IOMAP_SIZE);
+    if ((size_t)io_size > inst->iomap_capacity) {
+        /* SOEM already wrote past the buffer's view of the mapping; it keeps the pointer, so
+         * growing it now is unsafe. Sizing above makes this unreachable unless SOEM changes. */
+        edog_log_error(logger,
+            "IOmap mismatch: SOEM mapped %d bytes into a %zu-byte buffer", io_size,
+            inst->iomap_capacity);
         return -1;
     }
 
@@ -865,9 +975,19 @@ void ecat_master_close(ecat_master_instance_t *inst, edog_logger_t *logger)
      * flags and is a no-op when nothing was applied. */
     ecat_iface_state_revert(&inst->iface_state, logger);
 
-    /* Clear IO map */
-    memset(inst->iomap, 0, sizeof(inst->iomap));
+    /* Release the IOmap and the snapshot; the next open_and_scan allocates both again. */
+    if (inst->iomap != NULL && inst->iomap_capacity > 0) {
+        memset(inst->iomap, 0, inst->iomap_capacity);
+    }
+    free(inst->iomap);
+    inst->iomap = NULL;
+    inst->iomap_capacity = 0;
     inst->iomap_used_size = 0;
+
+    free(inst->slaves_snapshot);
+    inst->slaves_snapshot = NULL;
+    inst->slaves_snapshot_capacity = 0;
+    inst->slaves_snapshot_count = 0;
 
     edog_log_info(logger, "EtherCAT master closed");
 }
@@ -1112,4 +1232,313 @@ int ecat_master_get_slave_count(ecat_master_instance_t *inst)
     if (!inst->soem_initialized)
         return 0;
     return inst->ecx_context.slavecount;
+}
+
+/*
+ * =============================================================================
+ * Modular couplers (ETG.5001): detected modules and diagnostics
+ * =============================================================================
+ */
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static bool slave_has_coe(const ecx_contextt *ctx, int slave_pos)
+{
+    return (ctx->slavelist[slave_pos].mbx_proto & ECT_MBXPROT_COE) != 0;
+}
+
+int ecat_read_module_idents(ecx_contextt *ctx, int slave_pos, uint32_t **idents_out,
+                            int *count_out, char *err, size_t err_size, edog_logger_t *logger)
+{
+    *idents_out = NULL;
+    *count_out = 0;
+    if (slave_pos < 1 || slave_pos > ctx->slavecount) {
+        snprintf(err, err_size, "slave position %d out of range (1..%d)", slave_pos,
+                 ctx->slavecount);
+        return -1;
+    }
+    if (!slave_has_coe(ctx, slave_pos)) {
+        snprintf(err, err_size, "slave %d does not support CoE mailbox", slave_pos);
+        return -1;
+    }
+
+    uint8_t subcount = 0;
+    int size = (int)sizeof(subcount);
+    int wkc = ecx_SDOread(ctx, (uint16)slave_pos, 0xF050, 0, FALSE, &size, &subcount,
+                          EC_TIMEOUTRXM);
+    if (wkc <= 0 || size != (int)sizeof(subcount)) {
+        snprintf(err, err_size, "slave %d: 0xF050:0 read failed (wkc=%d); not a modular coupler?",
+                 slave_pos, wkc);
+        edog_log_warn(logger, "scan-modules slave=%d: 0xF050:0 read failed (wkc=%d)", slave_pos, wkc);
+        return -1;
+    }
+
+    int n = (int)subcount;
+    uint32_t *idents = calloc((size_t)(n > 0 ? n : 1), sizeof(uint32_t));
+    if (idents == NULL) {
+        snprintf(err, err_size, "out of memory");
+        return -1;
+    }
+    for (int i = 1; i <= n; i++) {
+        uint32_t ident = 0;
+        size = (int)sizeof(ident);
+        wkc = ecx_SDOread(ctx, (uint16)slave_pos, 0xF050, (uint8)i, FALSE, &size, &ident,
+                          EC_TIMEOUTRXM);
+        if (wkc <= 0 || size != (int)sizeof(ident)) {
+            snprintf(err, err_size, "slave %d: 0xF050:%d read failed (wkc=%d, size=%d)", slave_pos,
+                     i, wkc, size);
+            edog_log_warn(logger, "scan-modules slave=%d: 0xF050:%d read failed (wkc=%d)",
+                          slave_pos, i, wkc);
+            free(idents);
+            return -1;
+        }
+        idents[i - 1] = etohl(ident);
+    }
+
+    *idents_out = idents;
+    *count_out = n;
+    edog_log_info(logger, "scan-modules slave=%d: %d module ident(s) read", slave_pos, n);
+    return 0;
+}
+
+int ecat_scan_modules_offline(const char *ifname, int slave_pos, int preop_timeout_us,
+                              uint32_t **idents_out, int *count_out, char *err,
+                              size_t err_size, edog_logger_t *logger)
+{
+    *idents_out = NULL;
+    *count_out = 0;
+    ecx_contextt *ctx = calloc(1, sizeof(*ctx));
+    if (ctx == NULL) {
+        snprintf(err, err_size, "out of memory");
+        return -1;
+    }
+    if (!ecx_init(ctx, ifname)) {
+        ecat_soem_release_failed_init(ctx);
+        snprintf(err, err_size, "failed to open interface '%s'", ifname);
+        free(ctx);
+        return -1;
+    }
+
+    int rc = -1;
+    if (ecx_config_init(ctx) <= 0) {
+        snprintf(err, err_size, "no EtherCAT slaves found on '%s'", ifname);
+    } else if (slave_pos < 1 || slave_pos > ctx->slavecount) {
+        snprintf(err, err_size, "slave position %d out of range (1..%d)", slave_pos,
+                 ctx->slavecount);
+    } else {
+        /* The mailbox needs PRE-OP; ecx_config_init only requests it. */
+        ecx_statecheck(ctx, (uint16)slave_pos, EC_STATE_PRE_OP,
+                       preop_timeout_us > 0 ? preop_timeout_us : EC_TIMEOUTSTATE);
+        if ((ctx->slavelist[slave_pos].state & 0x0F) < EC_STATE_PRE_OP) {
+            snprintf(err, err_size, "slave %d did not reach PRE-OP (state=0x%04X)", slave_pos,
+                     ctx->slavelist[slave_pos].state);
+        } else {
+            rc = ecat_read_module_idents(ctx, slave_pos, idents_out, count_out, err, err_size,
+                                         logger);
+        }
+    }
+
+    ctx->slavelist[0].state = EC_STATE_INIT;
+    ecx_writestate(ctx, 0);
+    ecx_close(ctx);
+    free(ctx);
+    return rc;
+}
+
+/* Remaining budget in microseconds for one SDO, capped at the SOEM default. 0 when spent. */
+static int budget_timeout_us(uint64_t deadline_ms)
+{
+    uint64_t now = monotonic_ms();
+    if (now >= deadline_ms)
+        return 0;
+    uint64_t left_us = (deadline_ms - now) * 1000u;
+    return left_us < (uint64_t)EC_TIMEOUTRXM ? (int)left_us : EC_TIMEOUTRXM;
+}
+
+/* Acyclic lock within the remaining budget; true when held and the bus is still up. */
+static bool lock_for_sdo(ecat_master_instance_t *inst, uint64_t deadline_ms, int pos)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    uint64_t now = monotonic_ms();
+    uint64_t wait_ms = deadline_ms > now ? deadline_ms - now : 0;
+    until.tv_sec += (time_t)(wait_ms / 1000u);
+    until.tv_nsec += (long)(wait_ms % 1000u) * 1000000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_nsec -= 1000000000L;
+        until.tv_sec += 1;
+    }
+    if (pthread_mutex_timedlock(&inst->acyclic_lock, &until) != 0)
+        return false;
+    if (!inst->soem_initialized || pos > inst->ecx_context.slavecount) {
+        pthread_mutex_unlock(&inst->acyclic_lock);
+        return false;
+    }
+    return true;
+}
+
+void ecat_coupler_diag_free(ecat_coupler_diag_t *d)
+{
+    if (d == NULL)
+        return;
+    free(d->modules);
+    d->modules = NULL;
+    d->module_count = 0;
+}
+
+int ecat_master_read_coupler_diagnostics(ecat_master_instance_t *inst, const ecat_slave_t *slave,
+                                         int budget_ms, ecat_coupler_diag_t *out, char *err,
+                                         size_t err_size, edog_logger_t *logger)
+{
+    memset(out, 0, sizeof(*out));
+    ecx_contextt *ctx = &inst->ecx_context;
+    int pos = slave->position;
+    uint64_t deadline = monotonic_ms() + (uint64_t)(budget_ms > 0 ? budget_ms : 1);
+    if (pos < 1 || !lock_for_sdo(inst, deadline, pos)) {
+        snprintf(err, err_size, "the bus is not running or is recovering, retry");
+        return -1;
+    }
+    bool has_coe = slave_has_coe(ctx, pos);
+    pthread_mutex_unlock(&inst->acyclic_lock);
+    if (!has_coe) {
+        snprintf(err, err_size, "slave %d is not reachable over CoE", pos);
+        return -1;
+    }
+
+    const ecat_modular_t *m = &slave->modular;
+    out->modules = calloc((size_t)(m->module_count > 0 ? m->module_count : 1),
+                          sizeof(ecat_module_diag_t));
+    if (out->modules == NULL) {
+        snprintf(err, err_size, "out of memory");
+        return -1;
+    }
+    out->module_count = m->module_count;
+    for (int i = 0; i < m->module_count; i++) {
+        out->modules[i].slot = m->modules[i].slot;
+        out->modules[i].ident = m->modules[i].ident;
+    }
+
+    /* 0xF100 by Complete Access: SI0 padded to 16 bits, then the status bits. */
+    uint8_t buf[64];
+    int size = (int)sizeof(buf);
+    int wkc = 0;
+    int t = 0;
+    if (lock_for_sdo(inst, deadline, pos)) {
+        t = budget_timeout_us(deadline);
+        if (t > 0)
+            wkc = ecx_SDOread(ctx, (uint16)pos, 0xF100, 0, TRUE, &size, buf, t);
+        pthread_mutex_unlock(&inst->acyclic_lock);
+    }
+    if (wkc > 0 && size >= 4) {
+        out->status_known = true;
+        out->status_word = (uint16_t)(buf[2] | (buf[3] << 8));
+    } else {
+        edog_log_warn(logger, "diagnostics-slave slave=%d: 0xF100 read failed (wkc=%d, size=%d)",
+                      pos, wkc, size);
+    }
+
+    int incr = m->slot_index_increment;
+    for (int i = 0; i < out->module_count; i++) {
+        ecat_module_diag_t *md = &out->modules[i];
+        long index = 0xA000L + (long)(md->slot - 1) * incr;
+        /* Without an increment every module would read slot 1's object. */
+        if (incr <= 0 || index > 0xAFFF || !lock_for_sdo(inst, deadline, pos))
+            continue;
+        uint8_t state[4] = { 0 };
+        size = (int)sizeof(state);
+        wkc = 0;
+        t = budget_timeout_us(deadline);
+        if (t > 0)
+            wkc = ecx_SDOread(ctx, (uint16)pos, (uint16)index, 1, FALSE, &size, state, t);
+        pthread_mutex_unlock(&inst->acyclic_lock);
+        if (wkc > 0 && size >= 1) {
+            md->known = true;
+            md->status = state[0];
+        } else {
+            edog_log_warn(logger, "diagnostics-slave slave=%d: 0x%04lX:1 read failed (wkc=%d)", pos,
+                          index, wkc);
+        }
+    }
+    return 0;
+}
+
+/*
+ * =============================================================================
+ * Fixed PDO mappings
+ * =============================================================================
+ */
+
+static int verify_fixed_direction(ecat_master_instance_t *inst, const ecat_slave_t *slave,
+                                  const ecat_pdo_t *pdos, int count, edog_logger_t *logger)
+{
+    ecx_contextt *ctx = &inst->ecx_context;
+    int timeout = slave->timeouts.sdo_timeout_ms > 0 ? slave->timeouts.sdo_timeout_ms * 1000
+                                                     : EC_TIMEOUTRXM;
+    for (int p = 0; p < count; p++) {
+        const ecat_pdo_t *pdo = &pdos[p];
+        if (!pdo->fixed)
+            continue;
+        uint16_t index = (uint16_t)strtoul(pdo->index, NULL, 16);
+        uint8_t n = 0;
+        int size = (int)sizeof(n);
+        int wkc = ecx_SDOread(ctx, (uint16)slave->position, index, 0, FALSE, &size, &n, timeout);
+        if (wkc <= 0 || size != (int)sizeof(n)) {
+            edog_log_warn(logger,
+                "Slave %d (%s): mapping of fixed PDO 0x%04X not readable (wkc=%d); not verified",
+                slave->position, slave->name, index, wkc);
+            continue;
+        }
+        if (n != pdo->entry_count) {
+            edog_log_error(logger,
+                "Slave %d (%s): fixed PDO 0x%04X maps %u entries on the device, the configuration "
+                "has %d",
+                slave->position, slave->name, index, (unsigned)n, pdo->entry_count);
+            return -1;
+        }
+        for (int e = 0; e < pdo->entry_count; e++) {
+            const ecat_pdo_entry_t *entry = &pdo->entries[e];
+            uint32_t expected = ((uint32_t)strtoul(entry->index, NULL, 16) << 16) |
+                                ((uint32_t)entry->subindex << 8) | entry->bit_length;
+            uint32_t actual = 0;
+            size = (int)sizeof(actual);
+            wkc = ecx_SDOread(ctx, (uint16)slave->position, index, (uint8)(e + 1), FALSE, &size,
+                              &actual, timeout);
+            if (wkc <= 0 || size != (int)sizeof(actual)) {
+                edog_log_warn(logger,
+                    "Slave %d (%s): 0x%04X:%d not readable (wkc=%d); fixed PDO not verified",
+                    slave->position, slave->name, index, e + 1, wkc);
+                break;
+            }
+            actual = etohl(actual);
+            if (actual != expected) {
+                edog_log_error(logger,
+                    "Slave %d (%s): fixed PDO 0x%04X entry %d is 0x%08X on the device, the "
+                    "configuration has 0x%08X",
+                    slave->position, slave->name, index, e + 1, actual, expected);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+int ecat_master_verify_fixed_pdos(ecat_master_instance_t *inst, edog_logger_t *logger)
+{
+    for (int i = 0; i < inst->config.slave_count; i++) {
+        const ecat_slave_t *slave = &inst->config.slaves[i];
+        int pos = slave->position;
+        /* Module PDOs live on the coupler's station, so only plain CoE slaves are checked. */
+        if (slave->modular.present || pos < 1 || pos > inst->ecx_context.slavecount ||
+            !slave_has_coe(&inst->ecx_context, pos))
+            continue;
+        if (verify_fixed_direction(inst, slave, slave->rx_pdos, slave->rx_pdo_count, logger) != 0 ||
+            verify_fixed_direction(inst, slave, slave->tx_pdos, slave->tx_pdo_count, logger) != 0)
+            return -1;
+    }
+    return 0;
 }
