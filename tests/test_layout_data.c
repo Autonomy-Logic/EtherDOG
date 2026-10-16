@@ -14,6 +14,7 @@
 #include "unity.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -24,9 +25,12 @@ static char client_path[108];
 static char server[160];
 static const char *STATE_DIR = "/tmp";
 
+/* PDO entries are heap-allocated; the fixture pre-allocates each PDO's
+ * entries slot before add_entry() populates it. */
 static void add_entry(ecat_pdo_t *pdo, const char *index, uint8_t sub, uint8_t bits,
                       ecat_data_type_t type)
 {
+    TEST_ASSERT_TRUE(pdo->entry_count < pdo->entry_capacity);
     ecat_pdo_entry_t *e = &pdo->entries[pdo->entry_count++];
     snprintf(e->index, sizeof(e->index), "%s", index);
     e->subindex = sub;
@@ -41,17 +45,43 @@ void setUp(void)
     edog_logger_init(&logger, "TEST");
     snprintf(inst.name, sizeof(inst.name), "m0");
     inst.config.master.cycle_time_us = 1000;
+
+    /* Allocate 1 slave with 1 RxPDO (2 entries: 1 real + 1 padding), 1 TxPDO (1 entry). */
+    inst.config.slaves = (ecat_slave_t *)calloc(1, sizeof(ecat_slave_t));
+    TEST_ASSERT_NOT_NULL(inst.config.slaves);
+    inst.config.slave_capacity = 1;
     inst.config.slave_count = 1;
+
     ecat_slave_t *s = &inst.config.slaves[0];
     s->position = 1;
     snprintf(s->name, sizeof(s->name), "dev");
+
+    s->rx_pdos = (ecat_pdo_t *)calloc(1, sizeof(ecat_pdo_t));
+    TEST_ASSERT_NOT_NULL(s->rx_pdos);
+    s->rx_pdo_capacity = 1;
     s->rx_pdo_count = 1;
+    s->rx_pdos[0].entries = (ecat_pdo_entry_t *)calloc(2, sizeof(ecat_pdo_entry_t));
+    TEST_ASSERT_NOT_NULL(s->rx_pdos[0].entries);
+    s->rx_pdos[0].entry_capacity = 2;
     snprintf(s->rx_pdos[0].index, sizeof(s->rx_pdos[0].index), "0x1600");
     add_entry(&s->rx_pdos[0], "0x7000", 1, 1, ECAT_DTYPE_BOOL);
     add_entry(&s->rx_pdos[0], "0x0000", 0, 7, ECAT_DTYPE_PAD);
+
+    s->tx_pdos = (ecat_pdo_t *)calloc(1, sizeof(ecat_pdo_t));
+    TEST_ASSERT_NOT_NULL(s->tx_pdos);
+    s->tx_pdo_capacity = 1;
     s->tx_pdo_count = 1;
+    s->tx_pdos[0].entries = (ecat_pdo_entry_t *)calloc(1, sizeof(ecat_pdo_entry_t));
+    TEST_ASSERT_NOT_NULL(s->tx_pdos[0].entries);
+    s->tx_pdos[0].entry_capacity = 1;
     snprintf(s->tx_pdos[0].index, sizeof(s->tx_pdos[0].index), "0x1A00");
     add_entry(&s->tx_pdos[0], "0x6000", 1, 16, ECAT_DTYPE_UINT16);
+
+    /* Allocate the iomap buffer directly (we skip master_open_and_scan in this fake master). */
+    inst.iomap = (uint8_t *)calloc(16, 1);
+    TEST_ASSERT_NOT_NULL(inst.iomap);
+    inst.iomap_capacity = 16;
+    inst.iomap_used_size = 3;
 
     inst.soem_initialized = 1;
     inst.ecx_context.slavecount = 1;
@@ -68,6 +98,8 @@ void setUp(void)
 void tearDown(void)
 {
     ecat_data_destroy(&inst);
+    /* Release the per-master heap state (iomap, slaves_snapshot, config, layout). */
+    ecat_master_instance_destroy(&inst);
     edog_dgram_close(client_fd, client_path);
     client_fd = -1;
     client_path[0] = '\0';
@@ -146,6 +178,7 @@ static void round_trip(bool udp)
 {
     TEST_ASSERT_EQUAL_INT(0, ecat_layout_build(&inst, &logger));
     char endpoint[160], err[256];
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, ecat_data_alloc_buffers(&inst, err, sizeof(err)), err);
     uint64_t session = 0;
     open_client(udp ? "udp:127.0.0.1:1" : "unix:/unused", endpoint, sizeof(endpoint));
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, ecat_data_open(&inst, 0, endpoint, STATE_DIR, server,
@@ -214,6 +247,7 @@ void test_data_rejects_non_loopback_udp(void)
 {
     TEST_ASSERT_EQUAL_INT(0, ecat_layout_build(&inst, &logger));
     char server[160], err[256];
+    TEST_ASSERT_EQUAL_INT(0, ecat_data_alloc_buffers(&inst, err, sizeof(err)));
     uint64_t session;
     TEST_ASSERT_EQUAL_INT(-1, ecat_data_open(&inst, 0, "udp:10.0.0.1:5000", STATE_DIR, server,
                                              sizeof(server), &session, err, sizeof(err)));
@@ -230,4 +264,69 @@ void test_frame_header_rejects_bad_magic_and_length(void)
     TEST_ASSERT_FALSE(edog_frame_decode_header(frame, sizeof(frame) - 1, &out));
     frame[0] = 'X';
     TEST_ASSERT_FALSE(edog_frame_decode_header(frame, sizeof(frame), &out));
+}
+
+/* --- frame buffers ----------------------------------------------------------------------- */
+
+void test_data_open_refused_before_buffers_exist(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, ecat_layout_build(&inst, &logger));
+    char endpoint[160], server_ep[160], err[256];
+    uint64_t session = 0;
+    open_client("udp:127.0.0.1:1", endpoint, sizeof(endpoint));
+    TEST_ASSERT_EQUAL_INT(-1, ecat_data_open(&inst, 0, endpoint, STATE_DIR, server_ep,
+                                             sizeof(server_ep), &session, err, sizeof(err)));
+    TEST_ASSERT_NOT_NULL(strstr(err, "start the bus"));
+}
+
+void test_data_buffers_follow_the_layout_and_free_twice(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, ecat_layout_build(&inst, &logger));
+    char err[256];
+    for (int round = 0; round < 2; round++) {
+        TEST_ASSERT_EQUAL_INT(0, ecat_data_alloc_buffers(&inst, err, sizeof(err)));
+        TEST_ASSERT_EQUAL_UINT32(EDOG_FRAME_HEADER_SIZE + 1 + 1, (uint32_t)inst.data.rx_buf_size);
+        TEST_ASSERT_EQUAL_UINT32(EDOG_FRAME_HEADER_SIZE + 2, (uint32_t)inst.data.tx_buf_size);
+        TEST_ASSERT_NOT_NULL(inst.data.rx_latest);
+        ecat_data_free_buffers(&inst);
+        ecat_data_free_buffers(&inst);
+        TEST_ASSERT_NULL(inst.data.rx_buf);
+        TEST_ASSERT_NULL(inst.data.tx_buf);
+    }
+}
+
+void test_data_image_above_the_old_4096_byte_cap_is_accepted(void)
+{
+    inst.layout.output_bytes = 6000;
+    inst.layout.input_bytes = 9000;
+    char err[256];
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, ecat_data_alloc_buffers(&inst, err, sizeof(err)), err);
+    TEST_ASSERT_EQUAL_UINT32(EDOG_FRAME_HEADER_SIZE + 9000, (uint32_t)inst.data.tx_buf_size);
+}
+
+void test_data_image_above_the_frame_payload_is_refused(void)
+{
+    inst.layout.output_bytes = EDOG_FRAME_MAX_PAYLOAD + 1;
+    char err[256];
+    TEST_ASSERT_EQUAL_INT(-1, ecat_data_alloc_buffers(&inst, err, sizeof(err)));
+    TEST_ASSERT_NOT_NULL(strstr(err, "frame payload"));
+    TEST_ASSERT_NULL(inst.data.rx_buf);
+}
+
+void test_layout_refuses_an_image_above_the_frame_payload(void)
+{
+    inst.ecx_context.grouplist[0].Ibytes = EDOG_FRAME_MAX_PAYLOAD + 1;
+    TEST_ASSERT_EQUAL_INT(-1, ecat_layout_build(&inst, &logger));
+}
+
+void test_data_drops_an_oversized_output_frame(void)
+{
+    round_trip(DEFAULT_UDP);
+    /* Larger than the receive buffer: truncated, so the length check drops it. */
+    uint8_t big[5] = { 0 };
+    send_outputs(server, inst.data.session, 2, EDOG_FLAG_VALID, big, sizeof(big));
+    usleep(2000);
+    ecat_data_apply_outputs(&inst, 0);
+    TEST_ASSERT_EQUAL_HEX8(0x01, inst.iomap[0]);
+    TEST_ASSERT_EQUAL_UINT64(1, atomic_load(&inst.data.frames_dropped));
 }

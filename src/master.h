@@ -251,4 +251,69 @@ size_t ecat_master_get_iomap_size(ecat_master_instance_t *inst);
  */
 int ecat_master_get_slave_count(ecat_master_instance_t *inst);
 
+/** Release what a failed ecx_init() allocated; the context must not be used afterwards. */
+void ecat_soem_release_failed_init(ecx_contextt *ctx);
+
+/**
+ * @brief Read the detected module list (0xF050) of an ETG.5001 coupler.
+ *
+ * 0xF050:0 holds the module count and 0xF050:1..N one UDINT ident each, in slot order
+ * (slot = position in the list + 1). The slave must be in PRE-OP or higher.
+ *
+ * @param idents_out Written: heap array the caller frees, NULL on failure.
+ * @return 0, or -1 with @p err filled (not CoE, no 0xF050, SDO abort, OOM).
+ */
+int ecat_read_module_idents(ecx_contextt *ctx, int slave_pos, uint32_t **idents_out,
+                            int *count_out, char *err, size_t err_size, edog_logger_t *logger);
+
+/**
+ * @brief Read 0xF050 with a temporary SOEM context while no master runs on @p ifname.
+ *
+ * Opens the interface, scans, waits for PRE-OP on the slave, reads, requests INIT and closes.
+ */
+int ecat_scan_modules_offline(const char *ifname, int slave_pos, int preop_timeout_us,
+                              uint32_t **idents_out, int *count_out, char *err,
+                              size_t err_size, edog_logger_t *logger);
+
+/** State of one configured module. @c known is false when its state could not be read. */
+typedef struct {
+    int      slot;
+    uint32_t ident;
+    bool     known;
+    uint8_t  status;
+} ecat_module_diag_t;
+
+/** Coupler diagnostics. @c status_known is false when 0xF100 could not be read. */
+typedef struct {
+    bool                status_known;
+    uint16_t            status_word;
+    ecat_module_diag_t *modules;        /* heap-owned, one per configured module */
+    int                 module_count;
+} ecat_coupler_diag_t;
+
+/**
+ * @brief Read a running modular coupler's status (0xF100) and its modules' states.
+ *
+ * Module state is 0xA000 + (slot - 1) * slot_index_increment, sub-index 1, for every module of
+ * the configuration. Reads that fail or exceed @p budget_ms leave their value unknown. Takes the
+ * master's acyclic lock around each SDO, so the caller must not hold it; free @p out with
+ * ecat_coupler_diag_free.
+ *
+ * @return 0, or -1 with @p err filled when the bus is not running or the slave has no CoE.
+ */
+int ecat_master_read_coupler_diagnostics(ecat_master_instance_t *inst, const ecat_slave_t *slave,
+                                         int budget_ms, ecat_coupler_diag_t *out, char *err,
+                                         size_t err_size, edog_logger_t *logger);
+
+void ecat_coupler_diag_free(ecat_coupler_diag_t *d);
+
+/**
+ * @brief Compare each fixed PDO of a plain CoE slave with the mapping the device reports.
+ *
+ * Runs in PRE-OP before mapping. An unreadable mapping is logged and skipped.
+ *
+ * @return 0, or -1 when a device maps a fixed PDO differently from the configuration.
+ */
+int ecat_master_verify_fixed_pdos(ecat_master_instance_t *inst, edog_logger_t *logger);
+
 #endif /* ETHERCAT_MASTER_H */

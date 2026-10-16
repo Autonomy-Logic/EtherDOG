@@ -10,6 +10,12 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 option(ETHERDOG_BUILD_TESTS "Build the unit tests" OFF)
+option(ETHERDOG_SANITIZE "Build with AddressSanitizer, LeakSanitizer and UBSan (tests, debugging)" OFF)
+
+if(ETHERDOG_SANITIZE)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 
 file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION ETHERDOG_VERSION LIMIT_COUNT 1)
 
