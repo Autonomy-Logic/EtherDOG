@@ -201,3 +201,4 @@ Every log entry goes to stderr and to the in-memory ring that `logs` reads. With
 ```
 
 It reconnects on its own. Entries logged while disconnected are sent after reconnecting, as long as they are still in the ring.
+
