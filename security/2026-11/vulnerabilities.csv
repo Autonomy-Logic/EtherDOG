@@ -1,0 +1,7 @@
+severity,package,version,advisory,fixed_in,summary,url
+CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H,cJSON,1.7.18,CVE-2025-57052,,,https://osv.dev/CVE-2025-57052
+CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N,cJSON,1.7.18,CVE-2026-29036,,cJSON 1.7.19 Wrong-Key Modification via JSON Pointer Escape Decoding,https://osv.dev/CVE-2026-29036
+CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N,cJSON,1.7.18,CVE-2026-67215,,cJSON JSON Patch copy/add Uncontrolled Recursion Stack Exhaustion,https://osv.dev/CVE-2026-67215
+CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N,cJSON,1.7.18,CVE-2026-67216,,cJSON cJSON_Compare Exponential Complexity Denial of Service,https://osv.dev/CVE-2026-67216
+CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:L/VA:N/SC:N/SI:N/SA:N,cJSON,1.7.18,CVE-2026-67217,,cJSON JSON Patch Non-Atomic Application Destroys Data Before Validation,https://osv.dev/CVE-2026-67217
+CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:L/SC:N/SI:N/SA:N/E:P,cJSON,1.7.18,CVE-2026-87933,,DaveGamble cJSON cJSON_Utils.c cJSONUtils_MergePatch use after free,https://osv.dev/CVE-2026-87933
