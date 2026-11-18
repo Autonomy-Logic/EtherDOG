@@ -1,0 +1,36 @@
+{
+  "product": "etherdog",
+  "title": "EtherDOG",
+  "subtitle": "EtherCAT master service built on SOEM",
+  "version": "",
+  "sbomBasename": "etherdog",
+  "ecosystem": "c",
+  "securityContact": "Thiago Alves — thiago.alves@autonomylogic.com",
+  "advisorySource": "OSV via osv-scanner (git commit ranges of the upstream repositories)",
+  "_note_ids": "Every triage entry lists the advisory ids it accounts for. build-report.mjs cross-checks the live post-suppression scan against these: an advisory no entry claims is reported in section 4a as untriaged.",
+  "_note_counts": "advisories/counts are only rendered when the report is built without a live scan. No full assessment has been recorded yet, so they are zero.",
+  "advisories": { "total": 0, "critical": 0, "high": 0, "moderate": 0, "low": 0 },
+  "counts": {
+    "affected": { "n": 0, "sev": "none assessed" },
+    "mitigated": { "n": 0, "sev": "none assessed" },
+    "notAffected": { "n": 0, "pct": "0%" }
+  },
+  "headline": "No VEX assessment has been recorded for EtherDOG yet. Every advisory found by the scan is listed as untriaged until it is assessed.",
+  "scope": "EtherDOG is a C11 EtherCAT master service (Linux, and Windows through MSYS2) built with CMake. Its third-party code is the SOEM EtherCAT stack (git submodule, built from a patched copy), the vendored cJSON parser, the WinPcap headers and import libraries bundled in SOEM for Windows builds, and the Unity test framework (test binaries only).",
+  "scopeNote": "There is no package manager. The scanned components are the git commits listed in <code>security/components.json</code>: the submodule commits read from the tree and the upstream commit of each vendored source. The WinPcap files (no upstream commit), the host C library and the Npcap driver installed on Windows hosts are not scanned.",
+  "methodologyNote": "Advisory data was obtained from OSV via <code>osv-scanner</code>, which matches each component's git commit against the commit ranges recorded in the advisories. The source of truth for shipped versions is the submodule pointers in the git tree and the version macros of the vendored sources.",
+  "licenseNote": "EtherDOG is GPL-3.0-or-later. SOEM is dual-licensed (GPL-3.0 or a commercial licence from RT-Labs) and is consumed under GPL-3.0. cJSON and Unity are MIT. The bundled WinPcap files carry BSD-3-Clause and BSD-4-Clause-UC notices.",
+  "affected": [],
+  "mitigated": [],
+  "notAffected": [],
+  "criticalNote": "",
+  "remediation": [
+    "Triage the advisories reported for the vendored cJSON 1.7.18 and record a CISA VEX determination for each, or update the vendored copy."
+  ],
+  "practices": [
+    { "practice": "Third-party sources pinned by git commit (submodules) or vendored at a recorded upstream version", "status": "In place" },
+    { "practice": "SBOM generated per release in CycloneDX and SPDX", "status": "In place" },
+    { "practice": "CI security gate runs on every pull request and reports newly introduced critical advisories", "status": "In place" },
+    { "practice": "That gate configured as a required status check, so it blocks the merge", "status": "Not yet enforced" }
+  ]
+}
