@@ -472,7 +472,7 @@ test('c-components: a base tree without a components.json is resolved with this 
   assert.deepEqual(commits, own.filter((c) => c.commit).map((c) => c.commit));
 });
 
-test('c-components: merge-cdx replaces cdxgen detections of the same name and keeps the rest', () => {
+test('c-components: merge-cdx replaces same-name detections, drops include-level ones, keeps the rest', () => {
   const root = fixtureTree();
   const cdxPath = w('merge.cdx.json', {
     bomFormat: 'CycloneDX',
@@ -481,8 +481,10 @@ test('c-components: merge-cdx replaces cdxgen detections of the same name and ke
       { 'bom-ref': 'pkg:generic/prod', name: 'prod' },
       { 'bom-ref': 'pkg:generic/Threads', name: 'Threads' },
       { 'bom-ref': 'pkg:generic/Other', name: 'Other' },
+      { 'bom-ref': 'pkg:generic/stdio#stdio.h', purl: 'pkg:generic/stdio#stdio.h', name: 'stdio' },
+      { 'bom-ref': 'pkg:generic/bus#src/bus.c', purl: 'pkg:generic/bus#src/bus.c', name: 'bus' },
     ],
-    dependencies: [{ ref: 'pkg:generic/prod', dependsOn: ['pkg:generic/Threads', 'pkg:generic/Other'] }],
+    dependencies: [{ ref: 'pkg:generic/prod', dependsOn: ['pkg:generic/Threads', 'pkg:generic/Other', 'pkg:generic/stdio#stdio.h'] }],
   });
   const r = cc('merge-cdx', cdxPath, root);
   assert.equal(r.status, 0, r.stderr);
@@ -500,6 +502,7 @@ test('c-components: merge-cdx replaces cdxgen detections of the same name and ke
   assert.ok(rootDeps.includes(dep['bom-ref']));
   assert.ok(!rootDeps.some((d) => d.includes('testfw')), 'excluded-scope components are not runtime dependencies');
   assert.ok(!rootDeps.includes('pkg:generic/Threads'), 'edges to replaced detections are dropped');
+  assert.ok(!rootDeps.some((d) => d.includes('#')), 'edges to include-level detections are dropped');
   // The three artifacts still agree after the merge.
   const spdx = join(dir, 'merge.spdx.json');
   const csv = join(dir, 'merge.csv');

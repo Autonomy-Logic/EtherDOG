@@ -51,6 +51,11 @@ osv-scanner input (`osv-scan.sh`).
 | Threads, Python3, Git | detected by cdxgen in the CMake files | Yes, as host/build tools, no licence asserted | **No** |
 | Host C library, kernel, Npcap driver | provided by the host, not shipped | No | No |
 
+cdxgen's include-level analysis (one "component" per `#include`, system headers and
+EtherDOG's own files alike, purl with a `#file` subpath) is dropped in the merge; it
+only runs where cdxgen finds Java 21, so it would also make the SBOM differ between
+machines.
+
 Matching is by git commit against the commit ranges in OSV. An advisory that OSV
 records only by version or CPE, with no commit range, is not found.
 

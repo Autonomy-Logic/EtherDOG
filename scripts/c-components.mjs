@@ -51,7 +51,7 @@ switch (cmd) {
     const cdx = readJson(cdxPath);
     const r = mergeIntoCdx(cdx, inventory(root, file), root);
     writeFileSync(cdxPath, JSON.stringify(cdx, null, 2));
-    console.log(`Merged ${r.added} inventory component(s) into ${cdxPath} (replaced ${r.dropped} cdxgen detection(s), kept ${r.kept}).`);
+    console.log(`Merged ${r.added} inventory component(s) into ${cdxPath} (dropped ${r.dropped} cdxgen detection(s) replaced by it or include-level, kept ${r.kept}).`);
     break;
   }
   case 'check': {

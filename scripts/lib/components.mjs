@@ -126,7 +126,10 @@ export function toCdxComponent(c, root) {
   return comp;
 }
 
-// Merges the inventory into a cdxgen BOM. Inventory entries replace cdxgen detections of the same name; other detections stay.
+// A cdxgen detection from include-level source analysis: one per #include (system headers, first-party files), purl has a file subpath.
+export const isIncludeDetection = (c) => /#/.test(String(c.purl || c['bom-ref'] || ''));
+
+// Merges the inventory into a cdxgen BOM. Inventory entries replace cdxgen detections of the same name, include-level detections are dropped, the rest stay.
 export function mergeIntoCdx(cdx, inv, root) {
   const p = inv.product;
   const oldRoot = cdx.metadata?.component?.['bom-ref'];
@@ -142,7 +145,7 @@ export function mergeIntoCdx(cdx, inv, root) {
   const replaced = new Set([p.name.toLowerCase(), ...inv.components.map((c) => c.name.toLowerCase())]);
   const dropped = new Set();
   const kept = (cdx.components || []).filter((c) => {
-    if (replaced.has(String(c.name).toLowerCase())) { dropped.add(c['bom-ref']); return false; }
+    if (replaced.has(String(c.name).toLowerCase()) || isIncludeDetection(c)) { dropped.add(c['bom-ref']); return false; }
     return true;
   });
   const added = inv.components.map((c) => toCdxComponent(c, root));
