@@ -1,0 +1,7 @@
+severity,package,version,advisory,fixed_in,summary,url,aliases
+CRITICAL,cJSON,1.7.18,CVE-2025-57052,,,https://osv.dev/CVE-2025-57052,
+HIGH,cJSON,1.7.18,CVE-2026-29036,,cJSON 1.7.19 Wrong-Key Modification via JSON Pointer Escape Decoding,https://osv.dev/CVE-2026-29036,
+HIGH,cJSON,1.7.18,CVE-2026-67215,,cJSON JSON Patch copy/add Uncontrolled Recursion Stack Exhaustion,https://osv.dev/CVE-2026-67215,
+HIGH,cJSON,1.7.18,CVE-2026-67216,,cJSON cJSON_Compare Exponential Complexity Denial of Service,https://osv.dev/CVE-2026-67216,
+MODERATE,cJSON,1.7.18,CVE-2026-67217,,cJSON JSON Patch Non-Atomic Application Destroys Data Before Validation,https://osv.dev/CVE-2026-67217,
+MODERATE,cJSON,1.7.18,CVE-2026-87933,,DaveGamble cJSON cJSON_Utils.c cJSONUtils_MergePatch use after free,https://osv.dev/CVE-2026-87933,
