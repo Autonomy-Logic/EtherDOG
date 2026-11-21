@@ -62,3 +62,4 @@ python3 tools/etherdog_client.py io --seconds 5 --set 1:0x7000:1=blink
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE). `include/etherdog_protocol.h` and `tools/etherdog_client.py` are MIT.
+
