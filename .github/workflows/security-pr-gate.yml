@@ -37,7 +37,8 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout PR head
+      # The default ref is the PR merge commit; full history gives its parents.
+      - name: Checkout PR merge commit
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -68,10 +69,13 @@ jobs:
 
       # The base tree is scanned with the HEAD scripts; its submodule commits are
       # read from its git tree, so its submodules need no checkout.
+      # The checkout is the PR merge commit: its first parent is the base it was
+      # merged onto. The event's base.sha is not refreshed when the base moves.
       - name: Scan BASE
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
-          git worktree add -f /tmp/base "${{ github.event.pull_request.base.sha }}"
+          BASE_SHA="$(git rev-parse HEAD^1)"
+          echo "Base commit: $BASE_SHA"
+          git worktree add -f /tmp/base "$BASE_SHA"
           bash scripts/osv-scan.sh /tmp/base /tmp/base.json /tmp/head-config.toml
 
       # THE GATE — non-zero exit here fails the check and (with branch protection)
