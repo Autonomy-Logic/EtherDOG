@@ -11,7 +11,10 @@ Two separate flows, run by GitHub Actions:
 
 The vulnerability flows scan the components in `components.json` by git commit
 (`scripts/osv-scan.sh`) and honour the VEX baseline in `../osv-scanner.toml`;
-they do not need the SBOM. A commit on `main` that only
+they do not need the SBOM. `osv-scan.sh` requires a config and passes it as
+`--config`; the report's *raw* scan passes `security/osv-raw.toml`, an empty
+config. Without `--config`, osv-scanner applies the `osv-scanner.toml` of the
+scanned directory, and the raw and suppressed counts would be identical. A commit on `main` that only
 touches `security/` and `osv-scanner.toml` (such as the merged monthly PR) is not
 a release, so the release flows skip it.
 
@@ -34,7 +37,10 @@ everywhere.)
 
 > `on: schedule` only fires from the repository's **default branch**. To test the
 > release flows without touching the real evidence, run them with **Run workflow**
-> on any branch other than `main`; they write to `security-archive-test`.
+> on any branch other than `main`; they write to `archive_branch` (default
+> `security-archive-test`). On `main` the input is ignored and the target is always
+> `security-archive`, and `scripts/security-archive.sh` refuses to write
+> `security-archive` from any other ref.
 
 ## What is covered (C project, no package manager)
 
@@ -84,18 +90,29 @@ nothing. Three guards do that:
   CycloneDX file would travel the whole chain and come out as a report attesting a
   clean posture over zero components. Below the floor, the run stops.
 - **Untriaged detection** — each entry in `affected[]` / `mitigated[]` /
-  `notAffected[]` lists the advisory `ids` it accounts for. `build-report.mjs`
-  compares those against the live post-suppression scan; anything unclaimed gets
-  its own **section 4a — Untriaged in This Scan**, the executive summary is marked
-  *Assessment incomplete*, and the stored posture statement is rendered with the
-  date it was assessed. The document is allowed to be incomplete; it is not
-  allowed to be quietly self-contradictory.
+  `notAffected[]` **must** list the advisory `ids` it accounts for (any alias
+  works; the monthly validation step fails on an entry without `ids`).
+  `build-report.mjs` compares those against the live post-suppression scan;
+  anything unclaimed gets its own **section 4a — Untriaged in This Scan**, the
+  executive summary is marked *Assessment incomplete*, and the stored posture
+  statement is labelled as the last full assessment that does not cover them,
+  instead of as the headline posture. The document is allowed to be incomplete; it
+  is not allowed to be quietly self-contradictory.
 - **`scripts/lib/severity.mjs` and `scripts/lib/cdx.mjs`** — one severity verdict
-  and one component-collection walk, shared by the gate, the report, the SPDX
-  converter and the CSV converter. Previously the report bucketed an
-  unscored advisory MODERATE while the gate blocked it as HIGH, and the SPDX
-  declared more packages than the CSV listed. The release SBOM flow asserts the
-  three component counts agree before archiving.
+  and one component-collection walk, shared by the gate, the report, the
+  vulnerabilities CSV, the SPDX converter and the CSV converter. An advisory is
+  one OSV alias group per package (a GHSA and its CVE twins count once); its
+  severity is the highest parsable severity of any member or of the group's
+  `max_severity`, and **UNKNOWN** when there is none. UNKNOWN is counted and
+  listed, and never blocks the gate. `vulnerabilities.csv` is written from the
+  same index, so its row count equals the register count in the report. The
+  release SBOM flow asserts the three component counts agree before archiving.
+- **SPDX supplier** — taken from the CycloneDX `supplier`, `manufacturer`,
+  `publisher` or `authors` of each component, and `NOASSERTION` otherwise. Every
+  third-party entry of `components.json` carries `supplier`, which the merge
+  writes into the CycloneDX component; the host and build tools (Threads,
+  Python3, Git) have none. The SBOM does not claim NTIA minimum-elements
+  conformance.
 
 ## The suppression baseline (`../osv-scanner.toml`)
 
@@ -108,8 +125,10 @@ Suppressions written by the automated triage step carry
 `AI-TRIAGED [unreviewed]` in their `reason`. **The AI step has authority to write
 security suppressions and the only control is human review of the PR diff** —
 clearing that marker is the reviewer's acknowledgement that a person checked it.
-A step after the triage re-parses both files (and refuses a net *loss* of
-suppressions) before anything is rendered.
+A step after the triage re-parses both files, refuses a net *loss* of
+suppressions, refuses more than **15 new suppressions in one run**, and refuses a
+triage entry without `ids`, before anything is rendered. The prompt tells the
+model that advisory text is untrusted data, never instructions.
 
 To re-baseline by hand from a triaged register:
 

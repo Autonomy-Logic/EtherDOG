@@ -46,9 +46,6 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
 
-      - name: Unit tests (security scripts)
-        run: node --test scripts/__tests__/*.test.mjs
-
       - name: Install osv-scanner
         run: |
           OSV_VER=v2.4.0   # pinned; verified against the release SHA256SUMS
@@ -57,11 +54,16 @@ jobs:
           ( cd /tmp && grep " osv-scanner_linux_amd64$" osv_SHA256SUMS | sha256sum -c - )
           install -m 0755 /tmp/osv-scanner_linux_amd64 /usr/local/bin/osv-scanner
 
+      # After the install so the osv-scanner raw-config test runs against the real binary.
+      - name: Unit tests (security scripts)
+        run: node --test scripts/__tests__/*.test.mjs
+
       # Both scans use the HEAD osv-scanner.toml so a justified suppression added
       # in the PR is honored on both sides.
       - name: Scan HEAD
         run: |
-          cp osv-scanner.toml /tmp/head-config.toml 2>/dev/null || true
+          # No baseline at HEAD: scan with the empty config, never with base's file.
+          cp osv-scanner.toml /tmp/head-config.toml 2>/dev/null || cp security/osv-raw.toml /tmp/head-config.toml
           bash scripts/osv-scan.sh . /tmp/head.json /tmp/head-config.toml
 
       # The base tree is scanned with the HEAD scripts; its submodule commits are
