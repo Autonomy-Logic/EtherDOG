@@ -1,0 +1,12 @@
+# osv-scanner suppression baseline for EtherDOG = the VEX "not affected" decisions
+# of the vulnerability report. Empty until a person (or the monthly triage, whose
+# entries carry "AI-TRIAGED [unreviewed]" in their reason until reviewed) records
+# a CISA VEX justification for an advisory. Every entry needs id, reason and
+# ignoreUntil (at most one quarter out), for example:
+#
+# [[IgnoredVulns]]
+# id = "CVE-0000-00000"
+# ignoreUntil = "2027-03-01T00:00:00Z"
+# reason = "VEX not_affected [vulnerable_code_not_present]: ..."
+#
+# The scanned components are listed in security/components.json.
