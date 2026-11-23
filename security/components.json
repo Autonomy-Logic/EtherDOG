@@ -1,0 +1,86 @@
+{
+  "_note": "Third-party code that no package manager declares: git submodules, vendored sources and bundled binaries. scripts/c-components.mjs merges this list into the CycloneDX SBOM and turns every entry with a commit into an osv-scanner input. Submodule commits are read from the git tree; the unit tests fail when a declared commit or version no longer matches the tree. Entries named here replace any cdxgen detection with the same name.",
+  "product": {
+    "name": "etherdog",
+    "versionFile": "VERSION",
+    "license": "GPL-3.0-or-later",
+    "supplier": "Autonomy Logic",
+    "purl": "pkg:github/autonomy-logic/etherdog",
+    "description": "EtherCAT master service built on SOEM"
+  },
+  "components": [
+    {
+      "name": "SOEM",
+      "kind": "submodule",
+      "path": "libs/soem",
+      "version": "2.0.0-1-ga7c74ce",
+      "commit": "a7c74cea13786426929ae71e94195fa91c4b9faf",
+      "repo": "https://github.com/OpenEtherCATsociety/SOEM",
+      "supplier": "OpenEtherCATsociety (RT-Labs AB)",
+      "license": "GPL-3.0-only",
+      "licenseFile": "libs/soem/LICENSE.md",
+      "scope": "required",
+      "patchesDir": "patches/soem",
+      "description": "Simple Open EtherCAT Master. Dual-licensed GPL-3.0 or RT-Labs commercial; consumed under GPL-3.0. Built from a patched copy of the pinned sources (patches/soem)."
+    },
+    {
+      "name": "cJSON",
+      "kind": "vendored",
+      "path": "src/cjson",
+      "version": "1.7.18",
+      "commit": "acc76239bee01d8e9c858ae2cab296704e52d916",
+      "versionFrom": {
+        "file": "src/cjson/cJSON.h",
+        "macros": ["CJSON_VERSION_MAJOR", "CJSON_VERSION_MINOR", "CJSON_VERSION_PATCH"]
+      },
+      "repo": "https://github.com/DaveGamble/cJSON",
+      "supplier": "Dave Gamble and cJSON contributors",
+      "license": "MIT",
+      "licenseFile": "src/cjson/cJSON.h",
+      "scope": "required",
+      "description": "JSON parser, vendored unmodified (cJSON.c and cJSON.h of the v1.7.18 tag)."
+    },
+    {
+      "name": "Unity",
+      "kind": "submodule",
+      "path": "libs/unity",
+      "version": "2.7.0-20-g2b80d1a",
+      "commit": "2b80d1a357271b20f15c9f2573ddab164a626132",
+      "repo": "https://github.com/ThrowTheSwitch/Unity",
+      "supplier": "ThrowTheSwitch",
+      "license": "MIT",
+      "licenseFile": "libs/unity/LICENSE.txt",
+      "scope": "excluded",
+      "description": "Unit test framework. Linked into the test binaries only, never into etherdog."
+    },
+    {
+      "name": "WinPcap Developer's Pack",
+      "kind": "bundled",
+      "path": "libs/soem/oshw/win32/wpcap",
+      "version": "",
+      "supplier": "CACE Technologies / NetGroup, Politecnico di Torino",
+      "license": "BSD-3-Clause AND BSD-4-Clause-UC",
+      "licenseFile": "libs/soem/oshw/win32/wpcap/Include/pcap.h",
+      "scope": "optional",
+      "description": "pcap headers and import libraries shipped inside SOEM, linked by Windows (MSYS2) builds only. The packet driver itself (Npcap) is installed on the host and not shipped. Upstream version not recorded in the files."
+    },
+    {
+      "name": "Threads",
+      "kind": "system",
+      "scope": "required",
+      "description": "POSIX threads, provided by the host C library (CMake find_package). Not shipped."
+    },
+    {
+      "name": "Python3",
+      "kind": "system",
+      "scope": "excluded",
+      "description": "Interpreter used by the test build to generate Unity runners. Not shipped."
+    },
+    {
+      "name": "Git",
+      "kind": "system",
+      "scope": "excluded",
+      "description": "Used at configure time to apply patches/soem. Not shipped."
+    }
+  ]
+}
