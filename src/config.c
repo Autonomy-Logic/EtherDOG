@@ -153,6 +153,52 @@ static int get_int(const cJSON *obj, const char *key, int default_val)
 }
 
 /**
+ * @brief An optional nanosecond value of distributed_clocks. Absent: *has = false and OK.
+ *        Present: an integer in [min, max], else ECAT_CONFIG_ERR_INVALID (never a default).
+ */
+static int get_ns(const cJSON *obj, const char *key, double min, double max, bool *has, int64_t *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    *has = false;
+    if (item == NULL) {
+        return ECAT_CONFIG_OK;
+    }
+    if (!cJSON_IsNumber(item) || item->valuedouble < min || item->valuedouble > max) {
+        return ECAT_CONFIG_ERR_INVALID;
+    }
+    int64_t v = (int64_t)item->valuedouble;
+    if ((double)v != item->valuedouble) {
+        return ECAT_CONFIG_ERR_INVALID;   /* not a whole number of nanoseconds */
+    }
+    *has = true;
+    *out = v;
+    return ECAT_CONFIG_OK;
+}
+
+void ecat_dc_times(const ecat_dc_config_t *dc, int master_cycle_us, ecat_dc_times_t *out)
+{
+    int unit_us = (dc->sync_unit_cycle_us > 0) ? dc->sync_unit_cycle_us : master_cycle_us;
+    uint32_t unit_ns = (uint32_t)((int64_t)unit_us * 1000);
+
+    if (dc->has_sync0_cycle_ns)
+        out->cycle0_ns = dc->sync0_cycle_ns;
+    else
+        out->cycle0_ns = (dc->sync0_cycle_us > 0) ? (uint32_t)((int64_t)dc->sync0_cycle_us * 1000) : unit_ns;
+
+    if (dc->has_sync1_cycle_ns)
+        out->cycle1_ns = dc->sync1_cycle_ns;
+    else
+        out->cycle1_ns = (dc->sync1_cycle_us > 0) ? (uint32_t)((int64_t)dc->sync1_cycle_us * 1000) : unit_ns;
+
+    out->shift_ns = dc->has_sync0_shift_ns ? dc->sync0_shift_ns : (int32_t)((int64_t)dc->sync0_shift_us * 1000);
+
+    if (!dc->enabled || !dc->sync0_enabled)
+        out->mode = ECAT_DC_OFF;
+    else
+        out->mode = dc->sync1_enabled ? ECAT_DC_SYNC01 : ECAT_DC_SYNC0;
+}
+
+/**
  * @brief Get a numeric value from a JSON field that may be a number or a string.
  *
  * Handles:
@@ -921,6 +967,9 @@ static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
     slave->dc.sync1_enabled = false;
     slave->dc.sync1_cycle_us = 0;
     slave->dc.sync1_shift_us = 0;
+    slave->dc.has_sync0_cycle_ns = false;
+    slave->dc.has_sync0_shift_ns = false;
+    slave->dc.has_sync1_cycle_ns = false;
     slave->strict_sdo = true;
 
     const cJSON *cfg = cJSON_GetObjectItemCaseSensitive(slave_json, "config");
@@ -975,6 +1024,23 @@ static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
             slave->dc.sync1_enabled = get_bool(dc, "sync1_enabled", false);
             slave->dc.sync1_cycle_us = get_int(dc, "sync1_cycle_us", 0);
             slave->dc.sync1_shift_us = get_int(dc, "sync1_shift_us", 0);
+
+            /* The nanosecond values: a wrong one aborts the slave parse. A drive given the
+             * wrong SYNC0 refuses SAFE-OP (AL 0x0030) far from the JSON that caused it. */
+            int64_t cycle0 = 0, shift0 = 0, cycle1 = 0;
+            int rc0 = get_ns(dc, "sync0_cycle_ns", 1, UINT32_MAX, &slave->dc.has_sync0_cycle_ns, &cycle0);
+            int rc1 = get_ns(dc, "sync0_shift_ns", INT32_MIN, INT32_MAX, &slave->dc.has_sync0_shift_ns, &shift0);
+            int rc2 = get_ns(dc, "sync1_cycle_ns", 0, UINT32_MAX, &slave->dc.has_sync1_cycle_ns, &cycle1);
+            if (rc0 != ECAT_CONFIG_OK || rc1 != ECAT_CONFIG_OK || rc2 != ECAT_CONFIG_OK) {
+                edog_log_error(g_config_logger,
+                    "Slave '%s' position %d: distributed_clocks *_ns must be integers in range "
+                    "(sync0_cycle_ns > 0, sync1_cycle_ns >= 0, sync0_shift_ns int32) -- aborting slave parse",
+                    slave->name, slave->position);
+                return ECAT_CONFIG_ERR_INVALID;
+            }
+            slave->dc.sync0_cycle_ns = (uint32_t)cycle0;
+            slave->dc.sync0_shift_ns = (int32_t)shift0;
+            slave->dc.sync1_cycle_ns = (uint32_t)cycle1;
         }
     }
 
