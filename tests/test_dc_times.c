@@ -108,14 +108,16 @@ void test_dc_Disabled_OrNoSync0_ShouldBeOff(void)
 
 void test_dc_ns_Ax8000_ShouldGiveSync0At62500ns(void)
 {
-    /* ESI OpMode DcSync62500: SYNC0 62500 ns, SYNC1 every 16th SYNC0 (the 1 ms bus cycle) */
+    /* ESI OpMode DcSync62500: SYNC0 62500 ns, SYNC1 once per 1 ms bus cycle. SOEM's model
+     * (ecx_dcsync01: TrueCyclTime = (CyclTime1 / CyclTime0 + 1) * CyclTime0) gives SYNC1 at
+     * the SYNC0 after CyclTime1, so 15 * 62500 = 937500 ns makes it every 16th SYNC0 = 1 ms */
     TEST_ASSERT_EQUAL_INT(ECAT_CONFIG_OK, parse_dc(
         "{\"enabled\": true, \"sync0_enabled\": true, \"sync1_enabled\": true,"
-        " \"sync0_cycle_us\": 62, \"sync0_cycle_ns\": 62500, \"sync1_cycle_ns\": 1000000}"));
+        " \"sync0_cycle_us\": 62, \"sync0_cycle_ns\": 62500, \"sync1_cycle_ns\": 937500}"));
     ecat_dc_times_t t = times_of_first_slave();
     TEST_ASSERT_EQUAL_INT(ECAT_DC_SYNC01, t.mode);
     TEST_ASSERT_EQUAL_UINT32(62500u, t.cycle0_ns);
-    TEST_ASSERT_EQUAL_UINT32(1000000u, t.cycle1_ns);
+    TEST_ASSERT_EQUAL_UINT32(937500u, t.cycle1_ns);
     TEST_ASSERT_EQUAL_INT32(0, t.shift_ns);
 }
 
