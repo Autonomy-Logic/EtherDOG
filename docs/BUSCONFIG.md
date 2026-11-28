@@ -132,6 +132,7 @@ read the modules' diagnostics.
 | `watchdog.sm_watchdog_enabled` / `sm_watchdog_ms` | `true` / `100` |
 | `watchdog.pdi_watchdog_enabled` / `pdi_watchdog_ms` | `false` / `100` |
 | `distributed_clocks.enabled`, `sync_unit_cycle_us`, `sync0_enabled`, `sync0_cycle_us`, `sync0_shift_us`, `sync1_enabled`, `sync1_cycle_us`, `sync1_shift_us` | `false` / `0` |
+| `distributed_clocks.sync0_cycle_ns`, `sync0_shift_ns`, `sync1_cycle_ns` | absent. Optional nanosecond values for cycles that are not whole microseconds (Beckhoff AX8000, ESI OpMode `DcSync62500`: `sync0_cycle_ns` = 62500). When present they win over the `*_us` value. `sync1_cycle_ns` is the SYNC1 delay after SYNC0, as in SOEM, and `0` means together with SYNC0 (without it, `sync1_cycle_us` = 0 means the sync unit cycle). They must be integers: `sync0_cycle_ns` ≥ 1, `sync1_cycle_ns` ≥ 0 (both up to 2^32−1) and `sync0_shift_ns` an int32. Anything else rejects the configuration |
 | `strict_sdo` | `true`: a failed SDO write aborts the start |
 
 ## diagnostics

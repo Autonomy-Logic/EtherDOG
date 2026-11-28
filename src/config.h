@@ -183,7 +183,37 @@ typedef struct {
     bool     sync1_enabled;
     int      sync1_cycle_us;
     int      sync1_shift_us;
+    /* Optional nanosecond values, for cycles that are not whole microseconds (Beckhoff
+     * AX8000: SYNC0 = 62500 ns). When present they win over the *_us value, and
+     * sync1_cycle_ns = 0 means SYNC1 fires together with SYNC0. */
+    bool     has_sync0_cycle_ns;
+    uint32_t sync0_cycle_ns;
+    bool     has_sync0_shift_ns;
+    int32_t  sync0_shift_ns;
+    bool     has_sync1_cycle_ns;
+    uint32_t sync1_cycle_ns;
 } ecat_dc_config_t;
+
+/** Which SYNC signals a slave gets. */
+typedef enum {
+    ECAT_DC_OFF = 0,
+    ECAT_DC_SYNC0,
+    ECAT_DC_SYNC01,
+} ecat_dc_mode_t;
+
+/** The DC times handed to SOEM (ecx_dcsync0 / ecx_dcsync01), in nanoseconds. */
+typedef struct {
+    ecat_dc_mode_t mode;
+    uint32_t       cycle0_ns;
+    uint32_t       cycle1_ns;  /* SYNC1: delay after SYNC0 (SOEM); 0 = together with SYNC0 */
+    int32_t        shift_ns;
+} ecat_dc_times_t;
+
+/**
+ * @brief The DC times of one slave: its nanosecond values, else its microsecond values,
+ *        else the sync unit cycle (sync_unit_cycle_us, or master_cycle_us when 0).
+ */
+void ecat_dc_times(const ecat_dc_config_t *dc, int master_cycle_us, ecat_dc_times_t *out);
 
 /** One `<Slot>` definition of a modular coupler (ETG.5001). */
 typedef struct {

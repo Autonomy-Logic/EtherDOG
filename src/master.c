@@ -610,42 +610,26 @@ static void ecat_master_configure_dc(ecat_master_instance_t *inst, edog_logger_t
             continue;
         }
 
-        /* Determine cycle time: use slave-specific or fall back to master cycle */
-        uint32_t cycle_ns;
-        if (slave->dc.sync_unit_cycle_us > 0) {
-            cycle_ns = (uint32_t)(slave->dc.sync_unit_cycle_us * 1000);
-        } else {
-            cycle_ns = (uint32_t)(config->master.cycle_time_us * 1000);
-        }
+        /* The times in ns: the slave's *_ns values, else its *_us values, else the cycle */
+        ecat_dc_times_t t;
+        ecat_dc_times(&slave->dc, config->master.cycle_time_us, &t);
 
-        if (slave->dc.sync0_enabled && slave->dc.sync1_enabled) {
-            /* Both SYNC0 and SYNC1 */
-            uint32_t cycle0_ns = (slave->dc.sync0_cycle_us > 0)
-                ? (uint32_t)(slave->dc.sync0_cycle_us * 1000) : cycle_ns;
-            uint32_t cycle1_ns = (slave->dc.sync1_cycle_us > 0)
-                ? (uint32_t)(slave->dc.sync1_cycle_us * 1000) : cycle_ns;
-            int32_t shift_ns = (int32_t)(slave->dc.sync0_shift_us * 1000);
-
+        if (t.mode == ECAT_DC_SYNC01) {
             ecx_dcsync01(&inst->ecx_context, (uint16)pos, TRUE,
-                         cycle0_ns, cycle1_ns, shift_ns);
+                         t.cycle0_ns, t.cycle1_ns, t.shift_ns);
 
             edog_log_info(logger,
                 "Slave %d (%s): DC SYNC0+SYNC1 enabled "
                 "(cycle0=%u ns, cycle1=%u ns, shift=%d ns)",
-                pos, slave->name, cycle0_ns, cycle1_ns, shift_ns);
+                pos, slave->name, t.cycle0_ns, t.cycle1_ns, t.shift_ns);
 
-        } else if (slave->dc.sync0_enabled) {
-            /* SYNC0 only */
-            uint32_t sync0_ns = (slave->dc.sync0_cycle_us > 0)
-                ? (uint32_t)(slave->dc.sync0_cycle_us * 1000) : cycle_ns;
-            int32_t shift_ns = (int32_t)(slave->dc.sync0_shift_us * 1000);
-
+        } else if (t.mode == ECAT_DC_SYNC0) {
             ecx_dcsync0(&inst->ecx_context, (uint16)pos, TRUE,
-                        sync0_ns, shift_ns);
+                        t.cycle0_ns, t.shift_ns);
 
             edog_log_info(logger,
                 "Slave %d (%s): DC SYNC0 enabled (cycle=%u ns, shift=%d ns)",
-                pos, slave->name, sync0_ns, shift_ns);
+                pos, slave->name, t.cycle0_ns, t.shift_ns);
 
         } else {
             /* DC enabled but no SYNC signals - just log it */
